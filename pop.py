@@ -62,6 +62,7 @@ MODEL_CANDIDATES_DEFAULT = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"]
 # 이미지 생성 후보(권한/정책에 따라 실패할 수 있어 fallback 처리)
 IMAGE_MODEL_CANDIDATES_DEFAULT = ["gpt-image-1"]
 
+
 # -----------------------------
 # Session State
 # -----------------------------
@@ -86,12 +87,18 @@ def init_state():
         "working_image_model": None,
         "outfit_images": [],  # [{title, b64, prompt, model}]
 
-        # ✅ OAuth 관련 상태
+        # OAuth 관련 상태
         "pinterest_oauth_state": None,
         "pinterest_access_token": None,
         "pinterest_refresh_token": None,
         "pinterest_token_expires_at": None,  # epoch seconds
         "pinterest_last_auth_error": None,
+
+        # ✅ 마지막 Pinterest 결과(분위기 분석/테마 적용에 활용)
+        "last_pins": [],  # [{title, description, alt_text, ...}]
+        # ✅ 추구미 진단 후 UI 테마 프로필
+        "ui_profile": None,  # dict
+        "ui_applied": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -99,6 +106,354 @@ def init_state():
 
 
 init_state()
+
+
+# -----------------------------
+# UI Theming (✅ 추가: 진단 결과 기반 UI 스타일 적용)
+# -----------------------------
+def _safe_hex(hx: str, fallback: str) -> str:
+    if not hx or not isinstance(hx, str):
+        return fallback
+    hx = hx.strip()
+    if len(hx) == 7 and hx.startswith("#"):
+        return hx
+    return fallback
+
+
+def _pick_first_hex(colors: List[Dict[str, str]], fallback: str) -> str:
+    for c in colors or []:
+        if isinstance(c, dict) and c.get("hex"):
+            return _safe_hex(c["hex"], fallback)
+    return fallback
+
+
+def _lower_join(*parts: str) -> str:
+    return " ".join([p for p in parts if p]).lower()
+
+
+def _extract_color_votes_from_text(text: str) -> Dict[str, int]:
+    """
+    Pinterest title/alt_text/description에서 자주 등장하는 색 단서로 투표.
+    아주 단순한 휴리스틱(가볍게 분위기 보조용).
+    """
+    t = (text or "").lower()
+    votes: Dict[str, int] = {}
+
+    def add(name: str, n: int = 1):
+        votes[name] = votes.get(name, 0) + n
+
+    # neutrals
+    for w in ["black", "charcoal", "graphite", "gray", "grey", "white", "ivory", "cream", "beige", "camel", "taupe"]:
+        if w in t:
+            add(w, 1)
+
+    # colors
+    for w in ["navy", "blue", "sky", "denim", "red", "burgundy", "wine", "pink", "rose", "coral", "green", "olive", "khaki", "brown"]:
+        if w in t:
+            add(w, 1)
+
+    # korean hints
+    kr_map = {
+        "블랙": "black",
+        "오프화이트": "ivory",
+        "아이보리": "ivory",
+        "베이지": "beige",
+        "카멜": "camel",
+        "그레이": "gray",
+        "회색": "gray",
+        "네이비": "navy",
+        "레드": "red",
+        "버건디": "burgundy",
+        "핑크": "pink",
+        "로즈": "rose",
+        "올리브": "olive",
+        "카키": "khaki",
+        "브라운": "brown",
+        "갈색": "brown",
+        "화이트": "white",
+    }
+    for k, v in kr_map.items():
+        if k.lower() in t:
+            add(v, 2)
+
+    return votes
+
+
+def _votes_to_style_bucket(votes: Dict[str, int]) -> str:
+    """
+    색 투표 결과로 대략적인 무드 버킷을 추정.
+    - monochrome: black/white/gray 중심
+    - soft: ivory/beige/pink/rose 중심
+    - bold: red/burgundy/black 대비
+    - classic: navy/camel/taupe 중심
+    """
+    if not votes:
+        return ""
+
+    score_mono = votes.get("black", 0) + votes.get("white", 0) + votes.get("gray", 0) + votes.get("grey", 0) + votes.get("charcoal", 0)
+    score_soft = votes.get("ivory", 0) + votes.get("cream", 0) + votes.get("beige", 0) + votes.get("pink", 0) + votes.get("rose", 0) + votes.get("coral", 0)
+    score_bold = votes.get("red", 0) + votes.get("burgundy", 0) + votes.get("wine", 0) + votes.get("black", 0)
+    score_classic = votes.get("navy", 0) + votes.get("camel", 0) + votes.get("taupe", 0) + votes.get("beige", 0)
+
+    best = max(
+        [("monochrome", score_mono), ("soft", score_soft), ("bold", score_bold), ("classic", score_classic)],
+        key=lambda x: x[1],
+    )
+    return best[0] if best[1] > 0 else ""
+
+
+def derive_ui_profile(style_report: Dict[str, Any], pins: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    추구미 리포트 + Pinterest 참고(텍스트 기반)로 UI 테마/톤을 구성.
+    실제 이미지 분석은 하지 않고, 리포트와 핀 메타(alt_text/title/description)로 분위기 보조 추정.
+    """
+    r = style_report or {}
+    mini = r.get("mini_report") or {}
+    guide = r.get("practice_guide") or {}
+    fashion = (guide.get("fashion") or {}) if isinstance(guide, dict) else {}
+
+    core = r.get("core_keywords") or []
+    selected = (st.session_state.get("style_inputs") or {}).get("keywords", []) or []
+    kset = set([str(x) for x in (core + selected) if x])
+
+    # Pinterest 텍스트 기반 색 단서 수집
+    votes: Dict[str, int] = {}
+    for p in pins or []:
+        t = _lower_join(p.get("title", ""), p.get("alt_text", ""), p.get("description", ""))
+        v = _extract_color_votes_from_text(t)
+        for kk, vv in v.items():
+            votes[kk] = votes.get(kk, 0) + vv
+    pin_bucket = _votes_to_style_bucket(votes)
+
+    # 리포트 팔레트(가능하면 우선 사용)
+    palette = fashion.get("color_palette") or []
+    avoid = fashion.get("avoid_colors") or []
+    pal_primary = _pick_first_hex(palette, "#6B7280")  # slate
+    pal_secondary = _pick_first_hex(palette[1:] if len(palette) > 1 else [], "#E5E7EB")  # light gray
+
+    # 키워드 기반 기본 버킷
+    if {"무채색의", "시크함", "절제된", "중성적인"} & kset:
+        base_bucket = "monochrome"
+    elif {"러블리", "귀여움", "청순함", "단아한"} & kset:
+        base_bucket = "soft"
+    elif {"강렬한", "섹시한", "섹시함"} & kset:
+        base_bucket = "bold"
+    elif {"우아함", "고급스러움", "단정한"} & kset:
+        base_bucket = "classic"
+    else:
+        base_bucket = "neutral"
+
+    # Pinterest 보조 버킷이 있으면 약하게 반영(같으면 강화, 다르면 중립으로 완화)
+    bucket = base_bucket
+    if pin_bucket:
+        if pin_bucket == base_bucket:
+            bucket = base_bucket
+        else:
+            # 상충 시: 리포트 팔레트가 있으면 그쪽을 우선, 없으면 neutral로
+            bucket = base_bucket if palette else "neutral"
+
+    # 버킷별 UI 팔레트/톤(기본값)
+    theme_map = {
+        "monochrome": {
+            "bg_a": "#0B0F19",
+            "bg_b": "#111827",
+            "card": "#0F172A",
+            "text": "#E5E7EB",
+            "muted": "#9CA3AF",
+            "accent": pal_primary if palette else "#A3A3A3",
+            "accent2": pal_secondary if palette else "#E5E7EB",
+            "emoji": "🖤",
+            "tone": "미니멀·시크",
+        },
+        "soft": {
+            "bg_a": "#FFF7FB",
+            "bg_b": "#FDF2F8",
+            "card": "#FFFFFF",
+            "text": "#111827",
+            "muted": "#6B7280",
+            "accent": pal_primary if palette else "#EC4899",
+            "accent2": pal_secondary if palette else "#FBCFE8",
+            "emoji": "🫧",
+            "tone": "소프트·러블리",
+        },
+        "bold": {
+            "bg_a": "#0B0F19",
+            "bg_b": "#1F2937",
+            "card": "#111827",
+            "text": "#F9FAFB",
+            "muted": "#9CA3AF",
+            "accent": pal_primary if palette else "#EF4444",
+            "accent2": pal_secondary if palette else "#FCA5A5",
+            "emoji": "🔥",
+            "tone": "강렬·포인트",
+        },
+        "classic": {
+            "bg_a": "#FAFAF9",
+            "bg_b": "#F5F5F4",
+            "card": "#FFFFFF",
+            "text": "#111827",
+            "muted": "#6B7280",
+            "accent": pal_primary if palette else "#0F766E",
+            "accent2": pal_secondary if palette else "#99F6E4",
+            "emoji": "✨",
+            "tone": "클래식·고급",
+        },
+        "neutral": {
+            "bg_a": "#F8FAFC",
+            "bg_b": "#EEF2FF",
+            "card": "#FFFFFF",
+            "text": "#0F172A",
+            "muted": "#475569",
+            "accent": pal_primary if palette else "#6366F1",
+            "accent2": pal_secondary if palette else "#C7D2FE",
+            "emoji": "🪞",
+            "tone": "균형·세련",
+        },
+    }
+    t = theme_map.get(bucket, theme_map["neutral"])
+
+    # 섹션 타이틀/이모지(조금 더 “분위기 맞춤”)
+    emoji = t["emoji"]
+    labels = {
+        "title": f"{emoji} 이미지 레시피 - 내 분위기 맞춤 모드",
+        "sec1": f"{emoji} 1) 무드/스타일 선택 (3~7개)",
+        "sec2": f"{emoji} 2) 추가 정보를 입력해주세요",
+        "sec3": f"{emoji} 3) (선택) 이미지 업로드 — 추구미 분위기 분석",
+        "pinterest": f"{emoji} Pinterest 참고 이미지(인물 이미지 검색)",
+        "report": f"{emoji} 추구미 분석 & 리포트",
+        "guide": f"{emoji} 실천 가이드 (방향성)",
+        "outfit": f"{emoji} 예시 코디 (텍스트 + 시각화)",
+        "chat": f"{emoji} 추구미 챗봇에게 물어보기",
+    }
+
+    # 채팅 입력 힌트도 분위기 맞춤
+    chat_hint = "예: '이 분위기를 유지하려면 오늘 딱 10분 안에 뭘 하면 좋아?'"
+    if bucket == "monochrome":
+        chat_hint = "예: '시크/절제 무드에서 과해 보이는 포인트 5가지만 콕 집어줘.'"
+    elif bucket == "soft":
+        chat_hint = "예: '청순/러블리 무드에서 촌스러움 피하는 기준을 체크리스트로 줘.'"
+    elif bucket == "bold":
+        chat_hint = "예: '강렬/섹시 무드에서 저렴해 보이지 않게 만드는 룰 3개 알려줘.'"
+    elif bucket == "classic":
+        chat_hint = "예: '우아/고급 무드에서 데일리로 무겁지 않게 만드는 조합을 알려줘.'"
+
+    return {
+        "bucket": bucket,
+        "tone": t["tone"],
+        "colors": {
+            "bg_a": t["bg_a"],
+            "bg_b": t["bg_b"],
+            "card": t["card"],
+            "text": t["text"],
+            "muted": t["muted"],
+            "accent": t["accent"],
+            "accent2": t["accent2"],
+        },
+        "labels": labels,
+        "chat_hint": chat_hint,
+        "pin_bucket": pin_bucket,
+        "pin_votes": votes,
+        "has_palette": bool(palette),
+        "avoid_colors": avoid,
+    }
+
+
+def apply_ui_profile_css(profile: Dict[str, Any]):
+    c = (profile or {}).get("colors") or {}
+    bg_a = _safe_hex(c.get("bg_a"), "#F8FAFC")
+    bg_b = _safe_hex(c.get("bg_b"), "#EEF2FF")
+    card = _safe_hex(c.get("card"), "#FFFFFF")
+    text = _safe_hex(c.get("text"), "#0F172A")
+    muted = _safe_hex(c.get("muted"), "#475569")
+    accent = _safe_hex(c.get("accent"), "#6366F1")
+    accent2 = _safe_hex(c.get("accent2"), "#C7D2FE")
+
+    st.markdown(
+        f"""
+        <style>
+          /* App background */
+          .stApp {{
+            background: linear-gradient(135deg, {bg_a} 0%, {bg_b} 100%) !important;
+            color: {text} !important;
+          }}
+
+          /* Main container spacing */
+          section.main > div.block-container {{
+            padding-top: 2.0rem;
+            padding-bottom: 4.0rem;
+            max-width: 1200px;
+          }}
+
+          /* Cards-ish blocks */
+          div[data-testid="stMetric"], div[data-testid="stExpander"] > details {{
+            border-radius: 16px !important;
+          }}
+
+          /* Inputs */
+          .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"] {{
+            border-radius: 14px !important;
+          }}
+
+          /* Buttons */
+          .stButton button {{
+            border-radius: 14px !important;
+            border: 1px solid rgba(148, 163, 184, 0.35) !important;
+          }}
+          .stButton button[kind="primary"] {{
+            background: {accent} !important;
+            border-color: {accent} !important;
+            color: white !important;
+          }}
+          .stButton button:hover {{
+            filter: brightness(0.98);
+          }}
+
+          /* Sidebar background */
+          section[data-testid="stSidebar"] {{
+            background: rgba(255,255,255,0.65);
+            backdrop-filter: blur(10px);
+          }}
+
+          /* Chat bubbles */
+          div[data-testid="stChatMessage"] {{
+            border-radius: 18px !important;
+          }}
+
+          /* A subtle "card" utility class */
+          .ch-card {{
+            background: {card};
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            border-radius: 18px;
+            padding: 14px 16px;
+          }}
+          .ch-muted {{
+            color: {muted};
+          }}
+          .ch-badge {{
+            display:inline-block;
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: {accent2};
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            font-size: 12px;
+            margin-right: 6px;
+          }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# UI 프로필이 있으면 즉시 적용
+if st.session_state.get("ui_profile"):
+    apply_ui_profile_css(st.session_state["ui_profile"])
+
+
+def L(key: str, fallback: str) -> str:
+    """UI 프로필 기반 라벨 반환"""
+    p = st.session_state.get("ui_profile") or {}
+    labels = p.get("labels") or {}
+    return labels.get(key, fallback)
 
 
 # -----------------------------
@@ -365,7 +720,7 @@ def generate_outfit_image_with_fallback(
 
 
 # -----------------------------
-# Pinterest OAuth helpers (✅ 추가)
+# Pinterest OAuth helpers
 # -----------------------------
 def pinterest_basic_auth_header(client_id: str, client_secret: str) -> str:
     raw = f"{client_id}:{client_secret}".encode("utf-8")
@@ -479,7 +834,7 @@ def pinterest_web_search_url(term: str) -> str:
 
 
 # -----------------------------
-# Pinterest helpers (기존 + 403 fallback 지원)
+# Pinterest API helpers
 # -----------------------------
 def pinterest_headers(access_token: str) -> Dict[str, str]:
     return {
@@ -548,7 +903,7 @@ def render_color_swatches(colors: List[Dict[str, str]], title: str = "컬러 팔
         with cols[i % len(cols)]:
             st.markdown(
                 f"""
-                <div style="border:1px solid #e5e7eb; border-radius:14px; padding:10px;">
+                <div style="border:1px solid rgba(148,163,184,0.25); border-radius:14px; padding:10px;">
                   <div style="height:44px; border-radius:10px; background:{hx};"></div>
                   <div style="margin-top:8px; font-weight:700;">{name}</div>
                   <div style="font-size:12px; opacity:0.75;">{hx}</div>
@@ -698,7 +1053,7 @@ with st.sidebar:
     )
     pinterest_scopes = [s.strip() for s in raw_scopes.split(" ") if s.strip()]
 
-    # ✅ 기존 토큰 직접 입력도 유지(원 코드 UI 보존)
+    # 기존: 토큰 직접 입력도 유지
     pinterest_token_manual = st.text_input("Pinterest Access Token (Bearer) - 수동", type="password", value="")
     st.caption(PINTEREST_NOTE)
 
@@ -787,6 +1142,13 @@ with st.sidebar:
     if st.session_state.get("pinterest_last_auth_error"):
         st.error(st.session_state["pinterest_last_auth_error"])
 
+    # ✅ UI 테마 리셋(진단 후 자동 적용을 되돌리고 싶을 때)
+    if st.button("🎛️ UI 테마 기본으로", use_container_width=True):
+        st.session_state["ui_profile"] = None
+        st.session_state["ui_applied"] = False
+        st.success("UI 테마를 기본으로 되돌렸어요.")
+        st.rerun()
+
     if st.button("🧹 초기화", use_container_width=True):
         st.session_state["style_messages"] = []
         st.session_state["style_report"] = None
@@ -811,13 +1173,17 @@ with st.sidebar:
         st.session_state["pinterest_token_expires_at"] = None
         st.session_state["pinterest_oauth_state"] = None
         st.session_state["pinterest_last_auth_error"] = None
+        st.session_state["last_pins"] = []
+        st.session_state["ui_profile"] = None
+        st.session_state["ui_applied"] = False
         st.success("초기화 완료!")
+        st.rerun()
 
     st.divider()
     st.markdown(PRIVACY_NOTICE)
 
 # -----------------------------
-# Token 선택 우선순위 (✅ OAuth > 수동 입력)
+# Token 선택 우선순위 (OAuth > 수동 입력)
 # -----------------------------
 pinterest_token_oauth = None
 if pinterest_client_id and pinterest_client_secret:
@@ -828,10 +1194,36 @@ pinterest_token = pinterest_token_oauth or (pinterest_token_manual.strip() or No
 # -----------------------------
 # Main
 # -----------------------------
-st.title("🫧이미지 레시피 - 직접 설계하는 내 이미지")
+st.title(L("title", "🫧이미지 레시피 - 직접 설계하는 내 이미지"))
+
+# ✅ 진단 후 UI 적용 상태 배너
+if st.session_state.get("ui_profile"):
+    p = st.session_state["ui_profile"]
+    st.markdown(
+        f"""
+        <div class="ch-card">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+            <div>
+              <div style="font-size:18px; font-weight:800; margin-bottom:4px;">
+                UI가 ‘{p.get('tone','맞춤')}’ 분위기로 적용됐어요
+              </div>
+              <div class="ch-muted" style="font-size:13px;">
+                (리포트 + Pinterest 참고 텍스트 기반으로 톤을 맞췄어요)
+              </div>
+            </div>
+            <div>
+              <span class="ch-badge">bucket: {p.get('bucket','')}</span>
+              <span class="ch-badge">pin-hint: {p.get('pin_bucket','') or 'n/a'}</span>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.write("")
 
 # 1) 키워드 선택 (3~7)
-st.subheader("1) 무드/스타일 선택 (3~7개)")
+st.subheader(L("sec1", "1) 무드/스타일 선택 (3~7개)"))
 selected = st.multiselect(
     "끌리는 키워드를 골라주세요",
     STYLE_KEYWORDS,
@@ -842,7 +1234,7 @@ st.session_state["style_inputs"]["keywords"] = selected
 st.caption("※ 최소 3개, 최대 7개를 선택해 주세요.")
 
 # 2) 추가 정보 입력
-st.subheader("2) 추가 정보를 입력해주세요")
+st.subheader(L("sec2", "2) 추가 정보를 입력해주세요"))
 col_a, col_b, col_c = st.columns(3)
 with col_a:
     st.session_state["style_inputs"]["text_like"] = st.text_area(
@@ -867,7 +1259,7 @@ with col_c:
     )
 
 # 3) 이미지 업로드 — 추구미 분위기 분석
-st.subheader("3) (선택) 이미지 업로드 — 추구미 분위기 분석")
+st.subheader(L("sec3", "3) (선택) 이미지 업로드 — 추구미 분위기 분석"))
 up = st.file_uploader("좋다고 느꼈던 이미지가 있으면 올려주세요 (jpg/png)", type=["jpg", "jpeg", "png"])
 if up is not None:
     img_bytes = up.read()
@@ -909,7 +1301,7 @@ if st.session_state["style_inputs"].get("uploaded_image_analysis"):
 st.divider()
 
 # Pinterest (OAuth/수동 토큰) + API 제한 시 웹검색 fallback
-st.subheader("🧷 Pinterest 참고 이미지(인물 이미지 검색)")
+st.subheader(L("pinterest", "🧷 Pinterest 참고 이미지(인물 이미지 검색)"))
 st.caption("선택한 추구미 키워드로 Pinterest에서 참고 이미지를 가져옵니다(권한/토큰 필요). API 제한 시 웹검색으로 대체합니다.")
 
 colp1, colp2 = st.columns([2, 1])
@@ -960,6 +1352,7 @@ with cols_btn[2]:
 
 if clear_cache:
     st.session_state["pinterest_cache"] = {}
+    st.session_state["last_pins"] = []
     st.success("캐시를 비웠어요!")
 
 pins = []
@@ -1014,8 +1407,12 @@ if do_search:
                         )
                         st.caption(f"API 오류 상세: {e}")
 
+# 캐시/결과 반영
 if not pins and term_to_search in st.session_state["pinterest_cache"]:
     pins = st.session_state["pinterest_cache"][term_to_search]
+
+if pins:
+    st.session_state["last_pins"] = pins  # ✅ 진단 UI 반영에 사용
 
 if fallback_web:
     st.link_button("🔎 Pinterest 웹에서 검색하기", fallback_web)
@@ -1051,9 +1448,9 @@ if pins:
 st.divider()
 
 # -----------------------------
-# 추구미 리포트 생성
+# 추구미 리포트 생성 (✅ 완료 후 UI를 '분위기 맞춤 모드'로 자동 전환)
 # -----------------------------
-st.subheader("🧾 추구미 분석 & 리포트")
+st.subheader(L("report", "🧾 추구미 분석 & 리포트"))
 can_run = 3 <= len(st.session_state["style_inputs"]["keywords"]) <= 7
 
 colr1, colr2 = st.columns([1, 2])
@@ -1076,6 +1473,16 @@ with colr1:
                     st.session_state["style_report"] = report
                     st.session_state["outfit_images"] = []
                     st.success(f"리포트 생성 완료! (사용 모델: {used_model})")
+
+                    # ✅ 리포트 + Pinterest 참고(최근 검색 결과)로 UI 프로필 생성/적용
+                    pins_for_mood = st.session_state.get("last_pins", []) or []
+                    ui_profile = derive_ui_profile(report, pins_for_mood)
+                    st.session_state["ui_profile"] = ui_profile
+                    st.session_state["ui_applied"] = True
+
+                    # CSS 즉시 적용을 위해 리런
+                    st.rerun()
+
                 except Exception as e:
                     st.error(f"리포트 생성 오류: {e}")
 
@@ -1110,7 +1517,7 @@ if st.session_state.get("style_report"):
         st.markdown("### 🧩 적용 전략")
         st.write(r["apply_strategy"])
 
-    st.markdown("### 🪞 실천 가이드 (방향성)")
+    st.markdown(f"### {L('guide', '🪞 실천 가이드 (방향성)')}")
     guide = r.get("practice_guide", {}) or {}
     m = guide.get("makeup", {}) or {}
     f = guide.get("fashion", {}) or {}
@@ -1145,7 +1552,7 @@ if st.session_state.get("style_report"):
         st.markdown("- 작은 습관:\n" + "\n".join([f"  - {x}" for x in b.get("daily_habits", [])]))
 
     st.divider()
-    st.subheader("🧥 예시 코디 (텍스트 + 시각화)")
+    st.subheader(L("outfit", "🧥 예시 코디 (텍스트 + 시각화)"))
 
     outfit_examples = r.get("outfit_examples") or []
     if not outfit_examples:
@@ -1226,14 +1633,19 @@ st.divider()
 # -----------------------------
 # 추구미 챗봇(대화)
 # -----------------------------
-st.subheader("💬 추구미 챗봇에게 물어보기")
+st.subheader(L("chat", "💬 추구미 챗봇에게 물어보기"))
 st.caption("선택 키워드/입력 내용을 바탕으로 ‘기준’과 ‘실천 팁’ 위주로 답해요. (브랜드 추천 없음)")
 
 for m in st.session_state["style_messages"]:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-user_msg = st.chat_input("예: '세련+절제+무채색 느낌을 유지하려면 메이크업에서 뭘 제일 조심해야 해?'")
+chat_hint = (st.session_state.get("ui_profile") or {}).get(
+    "chat_hint",
+    "예: '세련+절제+무채색 느낌을 유지하려면 메이크업에서 뭘 제일 조심해야 해?'",
+)
+user_msg = st.chat_input(chat_hint)
+
 if user_msg:
     st.session_state["style_messages"].append({"role": "user", "content": user_msg})
     with st.chat_message("user"):
@@ -1249,9 +1661,15 @@ if user_msg:
             "text_dislike": st.session_state["style_inputs"].get("text_dislike", ""),
             "text_constraints": st.session_state["style_inputs"].get("text_constraints", ""),
             "uploaded_image_analysis": st.session_state["style_inputs"].get("uploaded_image_analysis"),
+            "pinterest_hint": {
+                "last_term": st.session_state.get("pinterest_last_term", ""),
+                "pin_count": len(st.session_state.get("last_pins") or []),
+                "pin_color_votes": (st.session_state.get("ui_profile") or {}).get("pin_votes", {}),
+            },
             "style_report_summary": {
                 "type_name": (st.session_state.get("style_report") or {}).get("type_name_ko"),
                 "core_keywords": (st.session_state.get("style_report") or {}).get("core_keywords"),
+                "mini": (st.session_state.get("style_report") or {}).get("mini_report"),
             },
             "note": "브랜드/제품 추천 금지. 방향성과 기준, 체크리스트만.",
         }
