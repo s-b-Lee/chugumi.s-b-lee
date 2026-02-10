@@ -3,8 +3,8 @@ import base64
 import json
 import secrets
 import time
+import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
 
 import requests
 import streamlit as st
@@ -22,8 +22,7 @@ st.set_page_config(
 # Constants
 # -----------------------------
 PINTEREST_BASE = "https://api.pinterest.com/v5"
-PINTEREST_AUTH_BASE = "https://www.pinterest.com"
-PINTEREST_AUTHORIZE_URL = f"{PINTEREST_AUTH_BASE}/oauth/authorize"
+PINTEREST_AUTH_URL = "https://www.pinterest.com/oauth/"
 PINTEREST_TOKEN_URL = f"{PINTEREST_BASE}/oauth/token"
 
 STYLE_KEYWORDS = [
@@ -54,7 +53,7 @@ PRIVACY_NOTICE = (
 PINTEREST_NOTE = (
     "ℹ️ Pinterest API는 **OAuth Access Token(베어러 토큰)** 기반입니다. "
     "또한 `GET /v5/search/partner/pins`는 **베타이며 모든 앱에서 사용 불가**일 수 있어요. "
-    "사용 불가(403 등)면 앱에서 안내 문구가 표시됩니다."
+    "사용 불가(403 등)면 앱에서 Pinterest 웹검색으로 자동 대체합니다."
 )
 
 # 모델 후보: 접근 불가 모델이면 자동으로 다음 후보로 넘어감
@@ -62,7 +61,6 @@ MODEL_CANDIDATES_DEFAULT = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"]
 
 # 이미지 생성 후보(권한/정책에 따라 실패할 수 있어 fallback 처리)
 IMAGE_MODEL_CANDIDATES_DEFAULT = ["gpt-image-1"]
-
 
 # -----------------------------
 # Session State
@@ -87,13 +85,13 @@ def init_state():
         "working_model": None,
         "working_image_model": None,
         "outfit_images": [],  # [{title, b64, prompt, model}]
-        # ✅ Pinterest OAuth
+
+        # ✅ OAuth 관련 상태
         "pinterest_oauth_state": None,
         "pinterest_access_token": None,
         "pinterest_refresh_token": None,
-        "pinterest_token_expires_at": None,
-        "pinterest_connected": False,
-        "pinterest_last_oauth_error": None,
+        "pinterest_token_expires_at": None,  # epoch seconds
+        "pinterest_last_auth_error": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -367,23 +365,27 @@ def generate_outfit_image_with_fallback(
 
 
 # -----------------------------
-# ✅ Pinterest OAuth helpers (NEW)
+# Pinterest OAuth helpers (✅ 추가)
 # -----------------------------
-def _pinterest_basic_auth_header(client_id: str, client_secret: str) -> str:
-    token = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("utf-8")
-    return f"Basic {token}"
+def pinterest_basic_auth_header(client_id: str, client_secret: str) -> str:
+    raw = f"{client_id}:{client_secret}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("utf-8")
 
 
-def pinterest_build_authorize_url(client_id: str, redirect_uri: str, scope: str, state: str) -> str:
-    # Pinterest 문서 기준: response_type=code
+def pinterest_build_authorize_url(
+    client_id: str,
+    redirect_uri: str,
+    scopes: List[str],
+    state: str,
+) -> str:
     params = {
-        "response_type": "code",
         "client_id": client_id,
         "redirect_uri": redirect_uri,
-        "scope": scope,
+        "response_type": "code",
+        "scope": " ".join(scopes),
         "state": state,
     }
-    return f"{PINTEREST_AUTHORIZE_URL}?{urlencode(params)}"
+    return PINTEREST_AUTH_URL + "?" + urllib.parse.urlencode(params)
 
 
 def pinterest_exchange_code_for_token(
@@ -394,7 +396,7 @@ def pinterest_exchange_code_for_token(
     timeout: int = 20,
 ) -> Dict[str, Any]:
     headers = {
-        "Authorization": _pinterest_basic_auth_header(client_id, client_secret),
+        "Authorization": pinterest_basic_auth_header(client_id, client_secret),
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
     }
@@ -408,8 +410,8 @@ def pinterest_exchange_code_for_token(
         try:
             err = r.json()
         except Exception:
-            err = {"raw": r.text}
-        raise RuntimeError(f"Pinterest token 오류 ({r.status_code}): {err}")
+            err = {"message": r.text}
+        raise RuntimeError(f"토큰 교환 실패 ({r.status_code}): {err}")
     return r.json()
 
 
@@ -420,7 +422,7 @@ def pinterest_refresh_access_token(
     timeout: int = 20,
 ) -> Dict[str, Any]:
     headers = {
-        "Authorization": _pinterest_basic_auth_header(client_id, client_secret),
+        "Authorization": pinterest_basic_auth_header(client_id, client_secret),
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
     }
@@ -433,64 +435,55 @@ def pinterest_refresh_access_token(
         try:
             err = r.json()
         except Exception:
-            err = {"raw": r.text}
-        raise RuntimeError(f"Pinterest refresh 오류 ({r.status_code}): {err}")
+            err = {"message": r.text}
+        raise RuntimeError(f"토큰 갱신 실패 ({r.status_code}): {err}")
     return r.json()
 
 
-def pinterest_token_is_expired() -> bool:
-    exp = st.session_state.get("pinterest_token_expires_at")
-    if not exp:
-        return False
-    # 60초 여유
-    return time.time() > (float(exp) - 60)
+def pinterest_get_valid_access_token(client_id: str, client_secret: str) -> Optional[str]:
+    token = st.session_state.get("pinterest_access_token")
+    if not token:
+        return None
+
+    exp_at = st.session_state.get("pinterest_token_expires_at")
+    refresh = st.session_state.get("pinterest_refresh_token")
+
+    if not exp_at:
+        return token
+
+    now = int(time.time())
+    if now < int(exp_at) - 60:
+        return token
+
+    if not refresh:
+        return token
+
+    try:
+        j = pinterest_refresh_access_token(client_id, client_secret, refresh)
+        new_token = j.get("access_token")
+        if new_token:
+            st.session_state["pinterest_access_token"] = new_token
+        if j.get("refresh_token"):
+            st.session_state["pinterest_refresh_token"] = j["refresh_token"]
+        if j.get("expires_in"):
+            st.session_state["pinterest_token_expires_at"] = int(time.time()) + int(j["expires_in"])
+        return st.session_state.get("pinterest_access_token")
+    except Exception as e:
+        st.session_state["pinterest_last_auth_error"] = str(e)
+        return token
 
 
-def pinterest_get_working_access_token(
-    manual_token: str,
-    client_id: str,
-    client_secret: str,
-) -> Optional[str]:
-    """
-    우선순위:
-    1) OAuth로 연결된 access_token (만료 시 refresh 시도)
-    2) 사용자가 직접 입력한 Bearer token
-    """
-    # 1) OAuth token
-    if st.session_state.get("pinterest_access_token"):
-        if pinterest_token_is_expired() and st.session_state.get("pinterest_refresh_token") and client_id and client_secret:
-            try:
-                new_tok = pinterest_refresh_access_token(
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    refresh_token=st.session_state["pinterest_refresh_token"],
-                )
-                st.session_state["pinterest_access_token"] = new_tok.get("access_token")
-                # refresh_token이 다시 내려오면 갱신, 아니면 기존 유지
-                if new_tok.get("refresh_token"):
-                    st.session_state["pinterest_refresh_token"] = new_tok.get("refresh_token")
-                if new_tok.get("expires_in"):
-                    st.session_state["pinterest_token_expires_at"] = time.time() + float(new_tok["expires_in"])
-                st.session_state["pinterest_connected"] = True
-            except Exception as e:
-                st.session_state["pinterest_last_oauth_error"] = str(e)
-
-        if st.session_state.get("pinterest_access_token"):
-            return (st.session_state["pinterest_access_token"] or "").strip()
-
-    # 2) manual
-    if manual_token:
-        return manual_token.strip()
-
-    return None
+def pinterest_web_search_url(term: str) -> str:
+    q = urllib.parse.quote(term)
+    return f"https://www.pinterest.com/search/pins/?q={q}"
 
 
 # -----------------------------
-# Pinterest API helpers
+# Pinterest helpers (기존 + 403 fallback 지원)
 # -----------------------------
 def pinterest_headers(access_token: str) -> Dict[str, str]:
     return {
-        "Authorization": f"Bearer {access_token.strip()}",
+        "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -529,7 +522,7 @@ def pinterest_search_partner_pins(
     if bookmark:
         params["bookmark"] = bookmark
 
-    r = requests.get(url, headers=pinterest_headers(access_token), params=params, timeout=30)
+    r = requests.get(url, headers=pinterest_headers(access_token), params=params, timeout=20)
     if r.status_code != 200:
         try:
             err = r.json()
@@ -537,17 +530,6 @@ def pinterest_search_partner_pins(
             err = {"message": r.text}
         raise RuntimeError(f"Pinterest API 오류 ({r.status_code}): {err}")
     return r.json()
-
-
-def pinterest_token_check(access_token: str) -> Dict[str, Any]:
-    # 토큰이 유효한지 빠르게 확인
-    url = f"{PINTEREST_BASE}/user_account"
-    r = requests.get(url, headers=pinterest_headers(access_token), timeout=20)
-    try:
-        body = r.json()
-    except Exception:
-        body = {"raw": r.text}
-    return {"status_code": r.status_code, "body": body}
 
 
 # -----------------------------
@@ -692,129 +674,33 @@ def style_chat_system_prompt() -> str:
 # -----------------------------
 with st.sidebar:
     st.header("⚙️ 설정")
+
+    # OpenAI
     openai_key = st.text_input("OpenAI API Key", type="password", value="")
 
     st.divider()
-    st.subheader("🧷 Pinterest 연결")
+    st.subheader("🧷 Pinterest 연결(OAuth)")
 
-    # ✅ OAuth 입력 (NEW)
-    pinterest_client_id = st.text_input("Pinterest Client ID", type="password", value="")
+    pinterest_client_id = st.text_input("Pinterest Client ID", value="")
     pinterest_client_secret = st.text_input("Pinterest Client Secret", type="password", value="")
+
+    default_redirect_uri = "https://chugumis-b-lee-ver2.streamlit.app/"
     pinterest_redirect_uri = st.text_input(
-        "Pinterest Redirect URI",
-        value="",
-        help="Pinterest Developer Portal에 등록한 Redirect URI와 100% 동일해야 해요. (마지막 / 포함 여부까지)",
+        "Redirect URI (Developer Portal에 동일하게 등록)",
+        value=default_redirect_uri,
+        help="Pinterest 앱 설정의 Redirect URI와 100% 동일해야 합니다. 마지막 / 포함 여부까지 같아야 해요.",
     )
-    pinterest_scope = st.text_input(
+
+    raw_scopes = st.text_input(
         "OAuth Scopes (공백 구분)",
         value="pins:read",
-        help="처음엔 pins:read 처럼 최소로 시작 추천",
+        help="처음엔 최소 권한(pins:read)만 권장. 과다 요청은 Trial 심사에 불리할 수 있어요.",
     )
+    pinterest_scopes = [s.strip() for s in raw_scopes.split(" ") if s.strip()]
 
-    # 기존 수동 토큰 입력도 유지(필요 시)
-    pinterest_token_manual = st.text_input("Pinterest Access Token (Bearer) - 수동 입력(선택)", type="password", value="")
+    # ✅ 기존 토큰 직접 입력도 유지(원 코드 UI 보존)
+    pinterest_token_manual = st.text_input("Pinterest Access Token (Bearer) - 수동", type="password", value="")
     st.caption(PINTEREST_NOTE)
-
-    # ✅ OAuth callback 처리 (code/state)
-    qp = st.query_params
-    if "code" in qp:
-        code = qp.get("code")
-        state = qp.get("state")
-        err = qp.get("error")
-        err_desc = qp.get("error_description")
-
-        if err:
-            st.session_state["pinterest_last_oauth_error"] = f"{err}: {err_desc}"
-            st.error(f"Pinterest OAuth 오류: {err} / {err_desc}")
-            # 쿼리 파라미터 정리
-            st.query_params.clear()
-
-        elif code:
-            # state 검증
-            expected_state = st.session_state.get("pinterest_oauth_state")
-            if expected_state and state and state != expected_state:
-                st.session_state["pinterest_last_oauth_error"] = "state 불일치(보안 검증 실패)"
-                st.error("OAuth state가 일치하지 않아요. 다시 연결을 시도해 주세요.")
-                st.query_params.clear()
-            else:
-                if not (pinterest_client_id and pinterest_client_secret and pinterest_redirect_uri):
-                    st.error("Client ID/Secret/Redirect URI를 입력해야 토큰 발급이 가능해요.")
-                else:
-                    with st.spinner("Pinterest 토큰 발급 중..."):
-                        try:
-                            tok = pinterest_exchange_code_for_token(
-                                client_id=pinterest_client_id,
-                                client_secret=pinterest_client_secret,
-                                code=code,
-                                redirect_uri=pinterest_redirect_uri,
-                            )
-                            st.session_state["pinterest_access_token"] = tok.get("access_token")
-                            st.session_state["pinterest_refresh_token"] = tok.get("refresh_token")
-                            if tok.get("expires_in"):
-                                st.session_state["pinterest_token_expires_at"] = time.time() + float(tok["expires_in"])
-                            st.session_state["pinterest_connected"] = True
-                            st.session_state["pinterest_last_oauth_error"] = None
-                            st.success("✅ Pinterest OAuth 연결 완료! (access_token 발급됨)")
-                        except Exception as e:
-                            st.session_state["pinterest_last_oauth_error"] = str(e)
-                            st.error(f"토큰 발급 실패: {e}")
-                        finally:
-                            st.query_params.clear()
-
-    # OAuth 연결 버튼
-    if st.button("🔐 Pinterest OAuth로 연결(토큰 발급)", use_container_width=True):
-        if not (pinterest_client_id and pinterest_redirect_uri and pinterest_scope):
-            st.warning("Client ID / Redirect URI / Scope를 먼저 입력해 주세요.")
-        else:
-            state = secrets.token_urlsafe(16)
-            st.session_state["pinterest_oauth_state"] = state
-            auth_url = pinterest_build_authorize_url(
-                client_id=pinterest_client_id,
-                redirect_uri=pinterest_redirect_uri,
-                scope=pinterest_scope,
-                state=state,
-            )
-            st.link_button("👉 Pinterest 로그인/승인으로 이동", auth_url, use_container_width=True)
-            st.caption("승인 후 다시 이 앱으로 돌아오면 자동으로 access_token을 발급/저장합니다.")
-
-    col_o1, col_o2 = st.columns(2)
-    with col_o1:
-        if st.button("🧪 토큰 유효성 테스트", use_container_width=True):
-            tok = pinterest_get_working_access_token(
-                manual_token=pinterest_token_manual,
-                client_id=pinterest_client_id,
-                client_secret=pinterest_client_secret,
-            )
-            if not tok:
-                st.warning("테스트할 토큰이 없어요. OAuth로 연결하거나 수동 토큰을 넣어주세요.")
-            else:
-                try:
-                    res = pinterest_token_check(tok)
-                    st.write(res)
-                    if res.get("status_code") == 200:
-                        st.success("✅ 토큰이 유효해요.")
-                    else:
-                        st.error("❌ 토큰이 유효하지 않거나 권한이 부족해요.")
-                except Exception as e:
-                    st.error(f"테스트 실패: {e}")
-    with col_o2:
-        if st.button("🔌 Pinterest 연결 해제", use_container_width=True):
-            st.session_state["pinterest_access_token"] = None
-            st.session_state["pinterest_refresh_token"] = None
-            st.session_state["pinterest_token_expires_at"] = None
-            st.session_state["pinterest_connected"] = False
-            st.success("연결 해제 완료!")
-
-    if st.session_state.get("pinterest_connected") and st.session_state.get("pinterest_access_token"):
-        st.success("Pinterest 상태: 연결됨(OAuth)")
-        if st.session_state.get("pinterest_token_expires_at"):
-            remain = int(st.session_state["pinterest_token_expires_at"] - time.time())
-            st.caption(f"토큰 만료까지 약 {max(remain,0)}초")
-    else:
-        st.info("Pinterest 상태: 미연결 (OAuth 연결 또는 수동 토큰 사용 가능)")
-
-    if st.session_state.get("pinterest_last_oauth_error"):
-        st.warning(f"마지막 OAuth 오류: {st.session_state['pinterest_last_oauth_error']}")
 
     st.divider()
 
@@ -832,6 +718,74 @@ with st.sidebar:
     image_model_candidates = [m.strip() for m in raw_image_models.split(",") if m.strip()] or IMAGE_MODEL_CANDIDATES_DEFAULT
 
     img_size = st.selectbox("코디 이미지 크기", ["1024x1024", "512x512"], index=0)
+
+    # ---- OAuth 콜백 처리 (query param) ----
+    q = st.query_params
+    got_code = q.get("code")
+    got_state = q.get("state")
+    got_error = q.get("error")
+
+    col_auth1, col_auth2 = st.columns(2)
+    with col_auth1:
+        if st.button("🔐 Pinterest로 로그인", use_container_width=True):
+            if not (pinterest_client_id and pinterest_redirect_uri):
+                st.session_state["pinterest_last_auth_error"] = "Client ID / Redirect URI를 입력해 주세요."
+            else:
+                state = secrets.token_urlsafe(16)
+                st.session_state["pinterest_oauth_state"] = state
+                st.session_state["pinterest_last_auth_error"] = None
+                auth_url = pinterest_build_authorize_url(
+                    pinterest_client_id,
+                    pinterest_redirect_uri,
+                    pinterest_scopes,
+                    state,
+                )
+                st.link_button("로그인/동의 화면 열기", auth_url)
+
+    with col_auth2:
+        if st.button("🔓 Pinterest 연결 해제", use_container_width=True):
+            st.session_state["pinterest_access_token"] = None
+            st.session_state["pinterest_refresh_token"] = None
+            st.session_state["pinterest_token_expires_at"] = None
+            st.session_state["pinterest_oauth_state"] = None
+            st.session_state["pinterest_last_auth_error"] = None
+            st.success("Pinterest 연결을 해제했어요.")
+
+    if got_error:
+        st.session_state["pinterest_last_auth_error"] = f"OAuth 오류: {got_error}"
+    elif got_code:
+        if not pinterest_client_secret:
+            st.session_state["pinterest_last_auth_error"] = "Client Secret이 없어서 토큰 교환을 할 수 없어요."
+        else:
+            expected_state = st.session_state.get("pinterest_oauth_state")
+            if expected_state and got_state and got_state != expected_state:
+                st.session_state["pinterest_last_auth_error"] = "state 값이 일치하지 않아 요청을 거부했어요(보안)."
+            else:
+                try:
+                    token_json = pinterest_exchange_code_for_token(
+                        pinterest_client_id,
+                        pinterest_client_secret,
+                        got_code,
+                        pinterest_redirect_uri,
+                    )
+                    st.session_state["pinterest_access_token"] = token_json.get("access_token")
+                    st.session_state["pinterest_refresh_token"] = token_json.get("refresh_token")
+                    if token_json.get("expires_in"):
+                        st.session_state["pinterest_token_expires_at"] = int(time.time()) + int(token_json["expires_in"])
+                    st.session_state["pinterest_last_auth_error"] = None
+
+                    st.query_params.clear()
+                    st.success("Pinterest OAuth 연결 완료!")
+                except Exception as e:
+                    st.session_state["pinterest_last_auth_error"] = str(e)
+
+    if st.session_state.get("pinterest_access_token"):
+        st.success("Pinterest: OAuth 연결됨 ✅")
+    else:
+        st.info("Pinterest: OAuth 미연결")
+
+    if st.session_state.get("pinterest_last_auth_error"):
+        st.error(st.session_state["pinterest_last_auth_error"])
 
     if st.button("🧹 초기화", use_container_width=True):
         st.session_state["style_messages"] = []
@@ -852,17 +806,24 @@ with st.sidebar:
             "uploaded_image_name": None,
             "uploaded_image_analysis": None,
         }
-        # Pinterest OAuth 초기화
-        st.session_state["pinterest_oauth_state"] = None
         st.session_state["pinterest_access_token"] = None
         st.session_state["pinterest_refresh_token"] = None
         st.session_state["pinterest_token_expires_at"] = None
-        st.session_state["pinterest_connected"] = False
-        st.session_state["pinterest_last_oauth_error"] = None
+        st.session_state["pinterest_oauth_state"] = None
+        st.session_state["pinterest_last_auth_error"] = None
         st.success("초기화 완료!")
 
     st.divider()
     st.markdown(PRIVACY_NOTICE)
+
+# -----------------------------
+# Token 선택 우선순위 (✅ OAuth > 수동 입력)
+# -----------------------------
+pinterest_token_oauth = None
+if pinterest_client_id and pinterest_client_secret:
+    pinterest_token_oauth = pinterest_get_valid_access_token(pinterest_client_id, pinterest_client_secret)
+
+pinterest_token = pinterest_token_oauth or (pinterest_token_manual.strip() or None)
 
 # -----------------------------
 # Main
@@ -947,100 +908,81 @@ if st.session_state["style_inputs"].get("uploaded_image_analysis"):
 
 st.divider()
 
-# -----------------------------
-# Pinterest (선택)
-# -----------------------------
+# Pinterest (OAuth/수동 토큰) + API 제한 시 웹검색 fallback
 st.subheader("🧷 Pinterest 참고 이미지(인물 이미지 검색)")
-st.caption("선택한 추구미 키워드로 Pinterest에서 참고 이미지를 가져옵니다(권한/토큰 필요).")
+st.caption("선택한 추구미 키워드로 Pinterest에서 참고 이미지를 가져옵니다(권한/토큰 필요). API 제한 시 웹검색으로 대체합니다.")
 
-# ✅ OAuth 토큰(연결된 것) 또는 수동 토큰을 자동 선택
-pinterest_access_token = pinterest_get_working_access_token(
-    manual_token=st.session_state.get("pinterest_token_manual", "") if "pinterest_token_manual" in st.session_state else "",
-    client_id=st.session_state.get("pinterest_client_id", "") if "pinterest_client_id" in st.session_state else "",
-    client_secret=st.session_state.get("pinterest_client_secret", "") if "pinterest_client_secret" in st.session_state else "",
-)
-# 위에서 session_state에 저장 안 했으니, sidebar 입력값을 직접 쓰기 위해 다시 계산
-# (Streamlit 실행 흐름상 sidebar 지역변수는 여기 접근 불가 → 아래에서 직접 재사용)
-# 따라서 아래에서 다시 안전하게 가져옴:
-# - OAuth access token은 session_state에 저장되어 있음
-# - 수동 토큰은 sidebar 변수 pinterest_token_manual로 이미 존재하지만 scope 밖이라 접근 불가
-# → 해결: 아래에서 "현재 세션 OAuth 토큰만" 우선 사용하고, 수동 토큰은 안내로만 둠.
+colp1, colp2 = st.columns([2, 1])
+with colp1:
+    manual_term = st.text_input("직접 검색어(선택)", value=st.session_state.get("pinterest_last_term", ""))
+with colp2:
+    st.write("")
+    st.write("")
+    auto_expand = st.checkbox("🤖 AI로 검색어 추천", value=True)
 
-effective_token = st.session_state.get("pinterest_access_token")
-if not effective_token:
-    # OAuth가 없으면 수동 토큰 입력을 쓰고 싶지만, sidebar 지역변수 접근이 안됨.
-    # 그래서: session_state에 수동 토큰을 저장하도록 아래 input을 추가로 제공.
-    st.info("Pinterest OAuth로 연결하면 토큰을 자동으로 써요. 또는 아래에 수동 토큰을 넣어도 됩니다.")
-    manual_token_local = st.text_input("Pinterest Access Token (Bearer) - 여기에도 입력 가능", type="password", value="")
-    effective_token = manual_token_local.strip() if manual_token_local else None
+if auto_expand and openai_key and st.session_state["style_inputs"]["keywords"]:
+    if st.button("🔎 검색어 추천 만들기", use_container_width=True):
+        try:
+            spx, upx = pinterest_query_expander_prompt(st.session_state["style_inputs"]["keywords"])
+            qq, used_model = openai_json_with_fallback(
+                openai_key,
+                spx,
+                upx,
+                model_candidates=model_candidates,
+                temperature=0.2,
+                timeout=60,
+            )
+            st.session_state["pinterest_suggested_queries"] = (qq.get("queries", []) or [])[:6]
+            st.session_state["pinterest_negative_terms"] = (qq.get("negative_terms", []) or [])[:6]
+            st.success(f"추천 검색어 생성 완료! (사용 모델: {used_model})")
+        except Exception as e:
+            st.error(f"검색어 추천 오류: {e}")
 
-if not effective_token:
-    st.warning("Pinterest 토큰이 없어요. 사이드바에서 OAuth로 연결하거나, 위 입력칸에 토큰을 넣어주세요.")
-else:
-    colp1, colp2 = st.columns([2, 1])
-    with colp1:
-        manual_term = st.text_input("직접 검색어(선택)", value=st.session_state.get("pinterest_last_term", ""))
-    with colp2:
-        st.write("")
-        st.write("")
-        auto_expand = st.checkbox("🤖 AI로 검색어 추천", value=True)
+suggested_queries = st.session_state.get("pinterest_suggested_queries", [])
+negative_terms = st.session_state.get("pinterest_negative_terms", [])
 
-    if auto_expand and openai_key and st.session_state["style_inputs"]["keywords"]:
-        if st.button("🔎 검색어 추천 만들기", use_container_width=True):
-            try:
-                spx, upx = pinterest_query_expander_prompt(st.session_state["style_inputs"]["keywords"])
-                qq, used_model = openai_json_with_fallback(
-                    openai_key,
-                    spx,
-                    upx,
-                    model_candidates=model_candidates,
-                    temperature=0.2,
-                    timeout=60,
-                )
-                st.session_state["pinterest_suggested_queries"] = (qq.get("queries", []) or [])[:6]
-                st.session_state["pinterest_negative_terms"] = (qq.get("negative_terms", []) or [])[:6]
-                st.success(f"추천 검색어 생성 완료! (사용 모델: {used_model})")
-            except Exception as e:
-                st.error(f"검색어 추천 오류: {e}")
+if suggested_queries:
+    st.markdown("**추천 검색어:** " + " · ".join([f"`{q}`" for q in suggested_queries]))
+if negative_terms:
+    st.caption("제외(참고): " + ", ".join([f"`{q}`" for q in negative_terms]))
 
-    suggested_queries = st.session_state.get("pinterest_suggested_queries", [])
-    negative_terms = st.session_state.get("pinterest_negative_terms", [])
+term_to_search = manual_term.strip()
+if not term_to_search and suggested_queries:
+    term_to_search = suggested_queries[0]
 
-    if suggested_queries:
-        st.markdown("**추천 검색어:** " + " · ".join([f"`{q}`" for q in suggested_queries]))
-    if negative_terms:
-        st.caption("제외(참고): " + ", ".join([f"`{q}`" for q in negative_terms]))
+cols_btn = st.columns([1, 1, 2])
+with cols_btn[0]:
+    do_search = st.button("📌 Pinterest 검색", use_container_width=True)
+with cols_btn[1]:
+    clear_cache = st.button("🧽 Pinterest 캐시 비우기", use_container_width=True)
+with cols_btn[2]:
+    st.caption("※ /search/partner/pins는 베타라 403이면 API가 막힌 것이고, 웹검색 링크로 대체됩니다.")
 
-    term_to_search = manual_term.strip()
-    if not term_to_search and suggested_queries:
-        term_to_search = suggested_queries[0]
+if clear_cache:
+    st.session_state["pinterest_cache"] = {}
+    st.success("캐시를 비웠어요!")
 
-    cols_btn = st.columns([1, 1, 2])
-    with cols_btn[0]:
-        do_search = st.button("📌 Pinterest 검색", use_container_width=True)
-    with cols_btn[1]:
-        clear_cache = st.button("🧽 Pinterest 캐시 비우기", use_container_width=True)
-    with cols_btn[2]:
-        st.caption("※ /search/partner/pins는 베타라 403이면 사용 불가 안내가 나옵니다.")
+pins = []
+fallback_web = None
 
-    if clear_cache:
-        st.session_state["pinterest_cache"] = {}
-        st.success("캐시를 비웠어요!")
+if do_search:
+    if not term_to_search:
+        st.warning("검색어를 입력하거나(또는 추천 검색어 생성) 진행해 주세요.")
+    else:
+        st.session_state["pinterest_last_term"] = term_to_search
+        cache = st.session_state["pinterest_cache"]
 
-    pins = []
-    if do_search:
-        if not term_to_search:
-            st.warning("검색어를 입력하거나(또는 추천 검색어 생성) 진행해 주세요.")
+        if term_to_search in cache:
+            pins = cache[term_to_search]
         else:
-            st.session_state["pinterest_last_term"] = term_to_search
-            cache = st.session_state["pinterest_cache"]
-            if term_to_search in cache:
-                pins = cache[term_to_search]
+            if not pinterest_token:
+                fallback_web = pinterest_web_search_url(term_to_search)
+                st.info("Pinterest 토큰이 없어서 웹검색 링크로 안내할게요.")
             else:
                 with st.spinner("Pinterest에서 핀을 불러오는 중..."):
                     try:
                         data = pinterest_search_partner_pins(
-                            effective_token,
+                            pinterest_token,
                             term_to_search,
                             country_code="KR",
                             locale="ko-KR",
@@ -1065,46 +1007,46 @@ else:
                         cache[term_to_search] = pins
                         st.session_state["pinterest_cache"] = cache
                     except Exception as e:
-                        st.error(
-                            "Pinterest API에서 핀을 가져오지 못했어요.\n\n"
-                            f"- 사유: {e}\n\n"
-                            "가능한 원인:\n"
-                            "- OAuth 토큰이 잘못되었거나 만료됨(401)\n"
-                            "- 이 앱/토큰이 `GET /v5/search/partner/pins`(베타) 권한이 없음(403)\n"
-                            "- 토큰 스코프 부족\n"
-                            "- 레이트리밋/네트워크\n"
+                        fallback_web = pinterest_web_search_url(term_to_search)
+                        st.warning(
+                            "Pinterest API로 검색이 제한될 수 있어요(권한/베타/Trial 범위 등). "
+                            "대신 Pinterest 웹검색 링크를 제공할게요."
                         )
+                        st.caption(f"API 오류 상세: {e}")
 
-    if not pins and term_to_search in st.session_state["pinterest_cache"]:
-        pins = st.session_state["pinterest_cache"][term_to_search]
+if not pins and term_to_search in st.session_state["pinterest_cache"]:
+    pins = st.session_state["pinterest_cache"][term_to_search]
 
-    if pins:
-        st.markdown(f"#### 결과: `{term_to_search}`")
-        c1, c2, c3 = st.columns(3)
-        cols = [c1, c2, c3]
-        for i, p in enumerate(pins):
-            with cols[i % 3]:
-                if p.get("img"):
-                    link = p.get("link") or "https://www.pinterest.com/"
-                    title = (p.get("title") or "").strip() or "Pinterest Pin"
-                    st.markdown(
-                        f"""
-                        <a href="{link}" target="_blank" style="text-decoration:none;">
-                            <img src="{p["img"]}" style="width:100%; border-radius:14px; margin-bottom:6px;" />
-                        </a>
-                        <div style="font-weight:700; margin-bottom:8px;">{title}</div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.info("이미지 URL이 없는 핀이에요.")
-                with st.expander("상세"):
-                    if p.get("description"):
-                        st.write(p["description"])
-                    if p.get("alt_text"):
-                        st.caption(p["alt_text"])
-                    if p.get("link"):
-                        st.link_button("Pinterest에서 열기", p["link"])
+if fallback_web:
+    st.link_button("🔎 Pinterest 웹에서 검색하기", fallback_web)
+
+if pins:
+    st.markdown(f"#### 결과: `{term_to_search}`")
+    c1, c2, c3 = st.columns(3)
+    cols = [c1, c2, c3]
+    for i, p in enumerate(pins):
+        with cols[i % 3]:
+            if p.get("img"):
+                link = p.get("link") or "https://www.pinterest.com/"
+                title = (p.get("title") or "").strip() or "Pinterest Pin"
+                st.markdown(
+                    f"""
+                    <a href="{link}" target="_blank" style="text-decoration:none;">
+                        <img src="{p["img"]}" style="width:100%; border-radius:14px; margin-bottom:6px;" />
+                    </a>
+                    <div style="font-weight:700; margin-bottom:8px;">{title}</div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.info("이미지 URL이 없는 핀이에요.")
+            with st.expander("상세"):
+                if p.get("description"):
+                    st.write(p["description"])
+                if p.get("alt_text"):
+                    st.caption(p["alt_text"])
+                if p.get("link"):
+                    st.link_button("Pinterest에서 열기", p["link"])
 
 st.divider()
 
