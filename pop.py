@@ -26,12 +26,6 @@ PINTEREST_BASE = "https://api.pinterest.com/v5"
 PINTEREST_AUTH_URL = "https://www.pinterest.com/oauth/"
 PINTEREST_TOKEN_URL = f"{PINTEREST_BASE}/oauth/token"
 
-PRIVACY_NOTICE = (
-    "⚠️ **고지**: 이 앱은 의료/심리 **진단**을 제공하지 않습니다. "
-    "자해/자살 등 위기 상황이 있거나 안전이 우려되면, 즉시 112/119 또는 "
-    "가까운 응급실/전문기관의 도움을 받으세요."
-)
-
 PINTEREST_NOTE = (
     "ℹ️ Pinterest API는 **OAuth Access Token(베어러 토큰)** 기반입니다. "
     "또한 `GET /v5/search/partner/pins`는 **베타이며 모든 앱에서 사용 불가**일 수 있어요. "
@@ -196,11 +190,7 @@ def init_state():
         # Pinterest 결과
         "last_pins": [],
 
-        # UI 프로필
-        "ui_profile": None,
-        "ui_applied": False,
-
-        # ✅ (추가) 챗봇 코디 피드백용 사진/결과
+        # ✅ 챗봇 코디 피드백용 사진/결과
         "chat_style_photo_bytes": None,
         "chat_style_photo_name": None,
         "chat_style_feedback": None,  # dict
@@ -211,309 +201,6 @@ def init_state():
 
 
 init_state()
-
-
-# -----------------------------
-# UI Theming (existing)
-# -----------------------------
-def _safe_hex(hx: str, fallback: str) -> str:
-    if not hx or not isinstance(hx, str):
-        return fallback
-    hx = hx.strip()
-    if len(hx) == 7 and hx.startswith("#"):
-        return hx
-    return fallback
-
-
-def _pick_first_hex(colors: List[Dict[str, str]], fallback: str) -> str:
-    for c in colors or []:
-        if isinstance(c, dict) and c.get("hex"):
-            return _safe_hex(c["hex"], fallback)
-    return fallback
-
-
-def _lower_join(*parts: str) -> str:
-    return " ".join([p for p in parts if p]).lower()
-
-
-def _extract_color_votes_from_text(text: str) -> Dict[str, int]:
-    t = (text or "").lower()
-    votes: Dict[str, int] = {}
-
-    def add(name: str, n: int = 1):
-        votes[name] = votes.get(name, 0) + n
-
-    for w in ["black", "charcoal", "graphite", "gray", "grey", "white", "ivory", "cream", "beige", "camel", "taupe"]:
-        if w in t:
-            add(w, 1)
-
-    for w in ["navy", "blue", "sky", "denim", "red", "burgundy", "wine", "pink", "rose", "coral", "green", "olive", "khaki", "brown"]:
-        if w in t:
-            add(w, 1)
-
-    kr_map = {
-        "블랙": "black",
-        "오프화이트": "ivory",
-        "아이보리": "ivory",
-        "베이지": "beige",
-        "카멜": "camel",
-        "그레이": "gray",
-        "회색": "gray",
-        "네이비": "navy",
-        "레드": "red",
-        "버건디": "burgundy",
-        "핑크": "pink",
-        "로즈": "rose",
-        "올리브": "olive",
-        "카키": "khaki",
-        "브라운": "brown",
-        "갈색": "brown",
-        "화이트": "white",
-    }
-    for k, v in kr_map.items():
-        if k.lower() in t:
-            add(v, 2)
-
-    return votes
-
-
-def _votes_to_style_bucket(votes: Dict[str, int]) -> str:
-    if not votes:
-        return ""
-    score_mono = votes.get("black", 0) + votes.get("white", 0) + votes.get("gray", 0) + votes.get("grey", 0) + votes.get("charcoal", 0)
-    score_soft = votes.get("ivory", 0) + votes.get("cream", 0) + votes.get("beige", 0) + votes.get("pink", 0) + votes.get("rose", 0) + votes.get("coral", 0)
-    score_bold = votes.get("red", 0) + votes.get("burgundy", 0) + votes.get("wine", 0) + votes.get("black", 0)
-    score_classic = votes.get("navy", 0) + votes.get("camel", 0) + votes.get("taupe", 0) + votes.get("beige", 0)
-
-    best = max(
-        [("monochrome", score_mono), ("soft", score_soft), ("bold", score_bold), ("classic", score_classic)],
-        key=lambda x: x[1],
-    )
-    return best[0] if best[1] > 0 else ""
-
-
-def derive_ui_profile(style_report: Dict[str, Any], pins: List[Dict[str, Any]]) -> Dict[str, Any]:
-    r = style_report or {}
-    guide = r.get("practice_guide") or {}
-    fashion = (guide.get("fashion") or {}) if isinstance(guide, dict) else {}
-
-    core = r.get("core_keywords") or []
-    selected = (st.session_state.get("style_inputs") or {}).get("keywords", []) or []
-    kset = set([str(x) for x in (core + selected) if x])
-
-    votes: Dict[str, int] = {}
-    for p in pins or []:
-        t = _lower_join(p.get("title", ""), p.get("alt_text", ""), p.get("description", ""))
-        v = _extract_color_votes_from_text(t)
-        for kk, vv in v.items():
-            votes[kk] = votes.get(kk, 0) + vv
-    pin_bucket = _votes_to_style_bucket(votes)
-
-    palette = fashion.get("color_palette") or []
-    avoid = fashion.get("avoid_colors") or []
-    pal_primary = _pick_first_hex(palette, "#6B7280")
-    pal_secondary = _pick_first_hex(palette[1:] if len(palette) > 1 else [], "#E5E7EB")
-
-    if {"미니멀", "시크", "단정", "매니시"} & kset:
-        base_bucket = "monochrome"
-    elif {"러블리", "귀여움", "청순", "페미닌"} & kset:
-        base_bucket = "soft"
-    elif {"강렬", "섹시", "스트릿", "힙"} & kset:
-        base_bucket = "bold"
-    elif {"클래식", "올드머니", "도시적", "빈티지"} & kset:
-        base_bucket = "classic"
-    else:
-        base_bucket = "neutral"
-
-    bucket = base_bucket
-    if pin_bucket:
-        bucket = base_bucket if (pin_bucket == base_bucket or palette) else "neutral"
-
-    theme_map = {
-        "monochrome": {
-            "bg_a": "#0B0F19",
-            "bg_b": "#111827",
-            "card": "#0F172A",
-            "text": "#E5E7EB",
-            "muted": "#9CA3AF",
-            "accent": pal_primary if palette else "#A3A3A3",
-            "accent2": pal_secondary if palette else "#E5E7EB",
-            "emoji": "🖤",
-            "tone": "미니멀·시크",
-        },
-        "soft": {
-            "bg_a": "#FFF7FB",
-            "bg_b": "#FDF2F8",
-            "card": "#FFFFFF",
-            "text": "#111827",
-            "muted": "#6B7280",
-            "accent": pal_primary if palette else "#EC4899",
-            "accent2": pal_secondary if palette else "#FBCFE8",
-            "emoji": "🫧",
-            "tone": "소프트·러블리",
-        },
-        "bold": {
-            "bg_a": "#0B0F19",
-            "bg_b": "#1F2937",
-            "card": "#111827",
-            "text": "#F9FAFB",
-            "muted": "#9CA3AF",
-            "accent": pal_primary if palette else "#EF4444",
-            "accent2": pal_secondary if palette else "#FCA5A5",
-            "emoji": "🔥",
-            "tone": "강렬·포인트",
-        },
-        "classic": {
-            "bg_a": "#FAFAF9",
-            "bg_b": "#F5F5F4",
-            "card": "#FFFFFF",
-            "text": "#111827",
-            "muted": "#6B7280",
-            "accent": pal_primary if palette else "#0F766E",
-            "accent2": pal_secondary if palette else "#99F6E4",
-            "emoji": "✨",
-            "tone": "클래식·고급",
-        },
-        "neutral": {
-            "bg_a": "#F8FAFC",
-            "bg_b": "#EEF2FF",
-            "card": "#FFFFFF",
-            "text": "#0F172A",
-            "muted": "#475569",
-            "accent": pal_primary if palette else "#6366F1",
-            "accent2": pal_secondary if palette else "#C7D2FE",
-            "emoji": "🪞",
-            "tone": "균형·세련",
-        },
-    }
-    t = theme_map.get(bucket, theme_map["neutral"])
-    emoji = t["emoji"]
-
-    labels = {
-        "title": f"{emoji} 이미지 레시피 - 내 분위기 맞춤 모드",
-        "sec0": f"{emoji} 0) 성별 선택",
-        "sec1": f"{emoji} 1) 무드/스타일 선택 (3~7개)",
-        "sec2": f"{emoji} 2) 추가 정보를 입력해주세요",
-        "sec3": f"{emoji} 3) (선택) 이미지 업로드 — 추구미 분위기 분석",
-        "pinterest": f"{emoji} Pinterest 참고 이미지(인물 이미지 검색)",
-        "report": f"{emoji} 추구미 분석 & 리포트",
-        "guide": f"{emoji} 실천 가이드 (방향성)",
-        "gender_split": f"{emoji} 성별 분리 스타일링 방향성",
-        "outfit": f"{emoji} 예시 코디 (텍스트 + 시각화)",
-        "chat": f"{emoji} 추구미 챗봇에게 물어보기",
-        "chat_photo": f"{emoji} 사진으로 코디 피드백",
-    }
-
-    chat_hint = "예: '이 분위기를 유지하려면 오늘 딱 10분 안에 뭘 하면 좋아?'"
-    if bucket == "monochrome":
-        chat_hint = "예: '미니멀/시크 무드에서 어색해 보이는 포인트 5가지만 콕 집어줘.'"
-    elif bucket == "soft":
-        chat_hint = "예: '러블리/청순 무드에서 촌스러움 피하는 기준을 체크리스트로 줘.'"
-    elif bucket == "bold":
-        chat_hint = "예: '섹시/강렬 무드에서 저렴해 보이지 않게 만드는 룰 3개 알려줘.'"
-    elif bucket == "classic":
-        chat_hint = "예: '클래식/올드머니 무드에서 데일리로 무겁지 않게 만드는 조합을 알려줘.'"
-
-    return {
-        "bucket": bucket,
-        "tone": t["tone"],
-        "colors": {
-            "bg_a": t["bg_a"],
-            "bg_b": t["bg_b"],
-            "card": t["card"],
-            "text": t["text"],
-            "muted": t["muted"],
-            "accent": t["accent"],
-            "accent2": t["accent2"],
-        },
-        "labels": labels,
-        "chat_hint": chat_hint,
-        "pin_bucket": pin_bucket,
-        "pin_votes": votes,
-        "has_palette": bool(palette),
-        "avoid_colors": avoid,
-    }
-
-
-def apply_ui_profile_css(profile: Dict[str, Any]):
-    c = (profile or {}).get("colors") or {}
-    bg_a = _safe_hex(c.get("bg_a"), "#F8FAFC")
-    bg_b = _safe_hex(c.get("bg_b"), "#EEF2FF")
-    card = _safe_hex(c.get("card"), "#FFFFFF")
-    text = _safe_hex(c.get("text"), "#0F172A")
-    muted = _safe_hex(c.get("muted"), "#475569")
-    accent = _safe_hex(c.get("accent"), "#6366F1")
-    accent2 = _safe_hex(c.get("accent2"), "#C7D2FE")
-
-    st.markdown(
-        f"""
-        <style>
-          .stApp {{
-            background: linear-gradient(135deg, {bg_a} 0%, {bg_b} 100%) !important;
-            color: {text} !important;
-          }}
-          section.main > div.block-container {{
-            padding-top: 2.0rem;
-            padding-bottom: 4.0rem;
-            max-width: 1200px;
-          }}
-          div[data-testid="stMetric"], div[data-testid="stExpander"] > details {{
-            border-radius: 16px !important;
-          }}
-          .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"] {{
-            border-radius: 14px !important;
-          }}
-          .stButton button {{
-            border-radius: 14px !important;
-            border: 1px solid rgba(148, 163, 184, 0.35) !important;
-          }}
-          .stButton button[kind="primary"] {{
-            background: {accent} !important;
-            border-color: {accent} !important;
-            color: white !important;
-          }}
-          .stButton button:hover {{
-            filter: brightness(0.98);
-          }}
-          section[data-testid="stSidebar"] {{
-            background: rgba(255,255,255,0.65);
-            backdrop-filter: blur(10px);
-          }}
-          div[data-testid="stChatMessage"] {{
-            border-radius: 18px !important;
-          }}
-          .ch-card {{
-            background: {card};
-            border: 1px solid rgba(148, 163, 184, 0.25);
-            border-radius: 18px;
-            padding: 14px 16px;
-          }}
-          .ch-muted {{
-            color: {muted};
-          }}
-          .ch-badge {{
-            display:inline-block;
-            padding: 6px 10px;
-            border-radius: 999px;
-            background: {accent2};
-            border: 1px solid rgba(148, 163, 184, 0.25);
-            font-size: 12px;
-            margin-right: 6px;
-          }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-if st.session_state.get("ui_profile"):
-    apply_ui_profile_css(st.session_state["ui_profile"])
-
-
-def L(key: str, fallback: str) -> str:
-    p = st.session_state.get("ui_profile") or {}
-    labels = p.get("labels") or {}
-    return labels.get(key, fallback)
 
 
 # -----------------------------
@@ -713,7 +400,7 @@ def openai_vision_analyze_style_with_fallback(
     return json.loads(content), model
 
 
-# ✅ (추가) 챗봇용: 스타일링 사진 → 리포트 기준 피드백(JSON)
+# ✅ 챗봇용: 스타일링 사진 → 리포트 기준 피드백(JSON)
 def openai_vision_outfit_feedback_with_fallback(
     api_key: str,
     image_bytes: bytes,
@@ -721,13 +408,6 @@ def openai_vision_outfit_feedback_with_fallback(
     style_inputs: Dict[str, Any],
     model_candidates: List[str],
 ) -> Tuple[Dict[str, Any], str]:
-    """
-    사용자가 '내 코디 사진'을 올렸을 때:
-    - 사진에서 패션 요소(아이템/핏/컬러/실루엣/텍스처/포인트)를 추출
-    - 추구미 리포트/키워드/제약과 비교해 정합성 피드백 제공
-    - 브랜드/제품명 금지
-    - 개인 식별/얼굴 분석 금지(얼굴은 무시하고 의상만)
-    """
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:image/jpeg;base64,{b64}"
 
@@ -742,12 +422,14 @@ def openai_vision_outfit_feedback_with_fallback(
         "- 반드시 JSON으로만 답하세요.\n"
     )
 
-    # 리포트 요약(토큰 절약 + 핵심 기준 고정)
     report_summary = {
         "type": style_report.get("type_name_ko"),
+        "identity_one_liner": style_report.get("identity_one_liner"),
         "core_keywords": style_report.get("core_keywords"),
         "mini_report": style_report.get("mini_report"),
-        "fashion_guide": (style_report.get("practice_guide") or {}).get("fashion"),
+        "practice_guide": style_report.get("practice_guide"),
+        # (추가) 성별 분리 섹션은 화면에는 안 보여도, 피드백 기준으로는 참고 가능
+        "gender_split_directions": style_report.get("gender_split_directions"),
     }
 
     user_text = {
@@ -1056,9 +738,6 @@ def render_selected_keyword_cards(selected_keywords: List[str]):
 
 
 def format_outfit_feedback_md(feedback: Dict[str, Any]) -> str:
-    """
-    코디 피드백 JSON을 챗 메시지/화면에 보기 좋은 Markdown으로 변환
-    """
     if not feedback:
         return "피드백 데이터가 없어요."
 
@@ -1148,18 +827,20 @@ def format_outfit_feedback_md(feedback: Dict[str, Any]) -> str:
 # -----------------------------
 def style_report_prompt(style_inputs: Dict[str, Any]) -> Tuple[str, str]:
     system_prompt = (
-        "당신은 '추구미 도우미(패션 트렌드 분석가 + 스타일링 앱 기획자)'입니다.\n"
+        "당신은 '추구미 도우미(스타일 코치 + 리포트 작성자)'입니다.\n"
         "입력(성별/키워드/선호/비선호/제약/이미지 분석)을 바탕으로 추구미 리포트를 생성합니다.\n"
         "브랜드/제품명 추천 금지(방향성과 기준, 범용 아이템 명칭만).\n"
         "과장 금지, 현실적인 추천.\n"
         "반드시 JSON으로만 답하세요.\n\n"
-        "중요 규칙:\n"
-        "- 선택 키워드(3~7개)를 중심으로.\n"
-        "- best_contexts(어울리는 상황)는 한국어로 구체적인 상황 4~7개.\n"
-        "- color_palette/avoid_colors는 name + hex(#RRGGBB).\n"
-        "- gender_split_directions: 키워드 5개를 골라(가능하면 선택 키워드에서) 성별 분리 방향성을 구조화.\n"
-        "- outfit_recommendations: 최소 3세트. 각 세트는 아래 포맷을 지켜 구체적으로.\n"
-        "- '피해야 할 요소'는 반드시 항목형(최소 5개)으로.\n"
+        "필수 규칙(중요):\n"
+        "1) type_name_ko/type_name_en은 '키워드 나열'처럼 보이지 않게, 사용자가 이해하기 쉬운 '말'로 지으세요.\n"
+        "   - 예: '무채색·절제' 같은 뭉치 대신, '깔끔한 라인으로 정돈감을 만드는 도회적 미니멀 타입'처럼 자연어로.\n"
+        "2) mini_report에서 best_contexts는 다른 항목(mood_summary, impression 등)과 분리해\n"
+        "   contexts_section 안에 따로 묶어서 작성하세요.\n"
+        "3) gender_split_directions는 생성하되(내부 참고용), 화면 표시는 '선택된 성별'의 내용만 쓰기 쉽도록 구조적으로 작성.\n"
+        "4) color_palette/avoid_colors는 name + hex(#RRGGBB).\n"
+        "5) outfit_recommendations는 최소 3세트.\n"
+        "6) 금지: 브랜드/제품명/로고 언급.\n"
     )
 
     keyword_context = {
@@ -1184,9 +865,13 @@ def style_report_prompt(style_inputs: Dict[str, Any]) -> Tuple[str, str]:
             "mini_report": {
                 "mood_summary": "",
                 "impression": "",
-                "best_contexts": ["구체적인 상황1", "구체적인 상황2", "구체적인 상황3", "구체적인 상황4"],
                 "watch_out": "",
                 "maintenance_difficulty": "낮음/중간/높음 중 하나",
+                "contexts_section": {
+                    "title": "어울리는 상황",
+                    "best_contexts": ["구체적인 상황1", "구체적인 상황2", "구체적인 상황3", "구체적인 상황4"],
+                    "why_it_works": "",
+                },
             },
             "apply_strategy": "",
             "practice_guide": {
@@ -1228,6 +913,7 @@ def style_report_prompt(style_inputs: Dict[str, Any]) -> Tuple[str, str]:
             "gender_split_directions는 5개(가능하면 선택 키워드에서 우선)",
             "코디 추천은 최소 3세트, 구매 가능한 범용 아이템으로 구체화",
             "avoid는 최소 5개 항목",
+            "mini_report.contexts_section.best_contexts는 최소 4개, 구체적으로",
         ],
     }
 
@@ -1403,12 +1089,6 @@ with st.sidebar:
     if st.session_state.get("pinterest_last_auth_error"):
         st.error(st.session_state["pinterest_last_auth_error"])
 
-    if st.button("🎛️ UI 테마 기본으로", use_container_width=True):
-        st.session_state["ui_profile"] = None
-        st.session_state["ui_applied"] = False
-        st.success("UI 테마를 기본으로 되돌렸어요.")
-        st.rerun()
-
     if st.button("🧹 초기화", use_container_width=True):
         st.session_state["style_messages"] = []
         st.session_state["style_report"] = None
@@ -1435,19 +1115,13 @@ with st.sidebar:
         st.session_state["pinterest_oauth_state"] = None
         st.session_state["pinterest_last_auth_error"] = None
         st.session_state["last_pins"] = []
-        st.session_state["ui_profile"] = None
-        st.session_state["ui_applied"] = False
 
-        # 챗 사진/피드백 초기화
         st.session_state["chat_style_photo_bytes"] = None
         st.session_state["chat_style_photo_name"] = None
         st.session_state["chat_style_feedback"] = None
 
         st.success("초기화 완료!")
         st.rerun()
-
-    st.divider()
-    st.markdown(PRIVACY_NOTICE)
 
 
 # -----------------------------
@@ -1459,40 +1133,14 @@ if pinterest_client_id and pinterest_client_secret:
 
 pinterest_token = pinterest_token_oauth or (pinterest_token_manual.strip() or None)
 
+
 # -----------------------------
 # Main
 # -----------------------------
-st.title(L("title", "🫧이미지 레시피 - 직접 설계하는 내 이미지"))
-
-# UI 적용 상태 배너
-if st.session_state.get("ui_profile"):
-    p = st.session_state["ui_profile"]
-    st.markdown(
-        f"""
-        <div class="ch-card">
-          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
-            <div>
-              <div style="font-size:18px; font-weight:800; margin-bottom:4px;">
-                UI가 ‘{p.get('tone','맞춤')}’ 분위기로 적용됐어요
-              </div>
-              <div class="ch-muted" style="font-size:13px;">
-                (리포트 + Pinterest 참고 텍스트 기반으로 톤을 맞췄어요)
-              </div>
-            </div>
-            <div>
-              <span class="ch-badge">bucket: {p.get('bucket','')}</span>
-              <span class="ch-badge">pin-hint: {p.get('pin_bucket','') or 'n/a'}</span>
-            </div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.write("")
-
+st.title("🫧이미지 레시피 - 직접 설계하는 내 이미지")
 
 # 0) 성별 선택
-st.subheader(L("sec0", "0) 성별 선택"))
+st.subheader("0) 성별 선택")
 gender_label = st.radio(
     "추천 결과를 분리하기 위해 성별을 선택해 주세요",
     options=["여성", "남성"],
@@ -1501,9 +1149,8 @@ gender_label = st.radio(
 )
 st.session_state["style_inputs"]["gender"] = "female" if gender_label == "여성" else "male"
 
-
 # 1) 키워드 선택 (3~7)
-st.subheader(L("sec1", "1) 무드/스타일 선택 (3~7개)"))
+st.subheader("1) 무드/스타일 선택 (3~7개)")
 selected = st.multiselect(
     "끌리는 키워드를 골라주세요",
     STYLE_KEYWORDS,
@@ -1515,7 +1162,7 @@ st.caption("※ 최소 3개, 최대 7개를 선택해 주세요.")
 render_selected_keyword_cards(selected)
 
 # 2) 추가 정보 입력
-st.subheader(L("sec2", "2) 추가 정보를 입력해주세요"))
+st.subheader("2) 추가 정보를 입력해주세요")
 col_a, col_b, col_c = st.columns(3)
 with col_a:
     st.session_state["style_inputs"]["text_like"] = st.text_area(
@@ -1540,7 +1187,7 @@ with col_c:
     )
 
 # 3) 이미지 업로드 — 추구미 분위기 분석
-st.subheader(L("sec3", "3) (선택) 이미지 업로드 — 추구미 분위기 분석"))
+st.subheader("3) (선택) 이미지 업로드 — 추구미 분위기 분석")
 up = st.file_uploader("좋다고 느꼈던 이미지가 있으면 올려주세요 (jpg/png)", type=["jpg", "jpeg", "png"])
 if up is not None:
     img_bytes = up.read()
@@ -1582,9 +1229,9 @@ if st.session_state["style_inputs"].get("uploaded_image_analysis"):
 st.divider()
 
 # -----------------------------
-# Pinterest (OAuth/수동 토큰) + API 제한 시 웹검색 fallback
+# Pinterest
 # -----------------------------
-st.subheader(L("pinterest", "🧷 Pinterest 참고 이미지(인물 이미지 검색)"))
+st.subheader("🧷 Pinterest 참고 이미지(인물 이미지 검색)")
 st.caption("선택한 추구미 키워드로 Pinterest에서 참고 이미지를 가져옵니다(권한/토큰 필요). API 제한 시 웹검색으로 대체합니다.")
 
 colp1, colp2 = st.columns([2, 1])
@@ -1734,9 +1381,9 @@ st.divider()
 
 
 # -----------------------------
-# 추구미 리포트 생성 (완료 후 UI 자동 전환)
+# 추구미 리포트 생성
 # -----------------------------
-st.subheader(L("report", "🧾 추구미 분석 & 리포트"))
+st.subheader("🧾 추구미 분석 & 리포트")
 can_run = 3 <= len(st.session_state["style_inputs"]["keywords"]) <= 7
 
 colr1, colr2 = st.columns([1, 2])
@@ -1759,13 +1406,6 @@ with colr1:
                     st.session_state["style_report"] = report
                     st.session_state["outfit_images"] = []
                     st.success(f"리포트 생성 완료! (사용 모델: {used_model})")
-
-                    pins_for_mood = st.session_state.get("last_pins", []) or []
-                    ui_profile = derive_ui_profile(report, pins_for_mood)
-                    st.session_state["ui_profile"] = ui_profile
-                    st.session_state["ui_applied"] = True
-                    st.rerun()
-
                 except Exception as e:
                     st.error(f"리포트 생성 오류: {e}")
 
@@ -1784,23 +1424,25 @@ if st.session_state.get("style_report"):
     mini = r.get("mini_report", {}) or {}
     st.markdown(f"- 분위기 요약: {mini.get('mood_summary','')}")
     st.markdown(f"- 타인 인상: {mini.get('impression','')}")
-
-    best = mini.get("best_contexts") or []
-    if best:
-        st.markdown("- 어울리는 상황:")
-        for x in best:
-            st.markdown(f"  - {x}")
-    else:
-        st.caption("어울리는 상황 정보가 없어요.")
-
     st.markdown(f"- 과도함 주의: {mini.get('watch_out','')}")
     st.markdown(f"- 유지 난이도: **{mini.get('maintenance_difficulty','')}**")
+
+    # ✅ contexts_section 따로 묶어서 표기
+    contexts = (mini.get("contexts_section") or {})
+    if contexts:
+        st.markdown(f"### 🗓️ {contexts.get('title','어울리는 상황')}")
+        best = contexts.get("best_contexts") or []
+        if best:
+            for x in best:
+                st.markdown(f"- {x}")
+        if contexts.get("why_it_works"):
+            st.caption(contexts.get("why_it_works"))
 
     if r.get("apply_strategy"):
         st.markdown("### 🧩 적용 전략")
         st.write(r["apply_strategy"])
 
-    st.markdown(f"### {L('guide', '🪞 실천 가이드 (방향성)')}")
+    st.markdown("### 🪞 실천 가이드 (방향성)")
     guide = r.get("practice_guide", {}) or {}
     m = guide.get("makeup", {}) or {}
     f = guide.get("fashion", {}) or {}
@@ -1834,47 +1476,39 @@ if st.session_state.get("style_report"):
     if b.get("daily_habits"):
         st.markdown("- 작은 습관:\n" + "\n".join([f"  - {x}" for x in b.get("daily_habits", [])]))
 
-    # 성별 분리 방향성
+    # ✅ (요구사항 1) 성별 분리 스타일링 방향성: 사용자에게는 선택 성별만 표시
     st.divider()
-    st.subheader(L("gender_split", "🧬 성별 분리 스타일링 방향성"))
+    st.subheader("🧬 선택 성별 기준 스타일링 방향성")
+    gender = st.session_state["style_inputs"].get("gender", "female")
+    gender_label = "여성" if gender == "female" else "남성"
+
     gsd = r.get("gender_split_directions") or []
     if not gsd:
         st.caption("성별 분리 방향성 데이터가 없어요.")
     else:
         for block in gsd[:5]:
             kw = (block or {}).get("keyword", "")
-            male = (block or {}).get("male", {}) or {}
-            female = (block or {}).get("female", {}) or {}
             common = (block or {}).get("common_core", []) or []
             diff = (block or {}).get("differentiation_points", []) or []
 
-            with st.expander(f"🔸 {kw} — 남/여 분리 방향성", expanded=False):
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("**남성 방향성**")
-                    st.markdown(f"- 핏: {male.get('fit','')}")
-                    st.markdown(f"- 색감: {male.get('colors','')}")
-                    if male.get("key_items"):
-                        st.markdown("- 주요 아이템:\n" + "\n".join([f"  - {x}" for x in male.get("key_items", [])]))
-                    st.markdown(f"- 무드: {male.get('mood','')}")
-                with c2:
-                    st.markdown("**여성 방향성**")
-                    st.markdown(f"- 핏: {female.get('fit','')}")
-                    st.markdown(f"- 색감: {female.get('colors','')}")
-                    if female.get("key_items"):
-                        st.markdown("- 주요 아이템:\n" + "\n".join([f"  - {x}" for x in female.get("key_items", [])]))
-                    st.markdown(f"- 무드: {female.get('mood','')}")
+            chosen = (block or {}).get(gender, {}) or {}
+            with st.expander(f"🔸 {kw} — {gender_label} 기준", expanded=False):
+                st.markdown(f"- **핏:** {chosen.get('fit','')}")
+                st.markdown(f"- **색감:** {chosen.get('colors','')}")
+                if chosen.get("key_items"):
+                    st.markdown("- **주요 아이템:**\n" + "\n".join([f"  - {x}" for x in chosen.get("key_items", [])]))
+                st.markdown(f"- **무드:** {chosen.get('mood','')}")
 
                 if common:
-                    st.markdown("**공통 핵심 유지 요소**")
+                    st.markdown("**공통 핵심(성별 무관하게 유지할 것)**")
                     st.markdown("\n".join([f"- {x}" for x in common]))
                 if diff:
-                    st.markdown("**차별화 포인트**")
+                    st.markdown("**이 키워드에서 특히 조절할 포인트**")
                     st.markdown("\n".join([f"- {x}" for x in diff]))
 
     # 코디 추천 + 시각화
     st.divider()
-    st.subheader(L("outfit", "🧥 예시 코디 (텍스트 + 시각화)"))
+    st.subheader("🧥 예시 코디 (텍스트 + 시각화)")
     outfit_recos = r.get("outfit_recommendations") or []
     if not outfit_recos:
         st.caption("코디 추천이 없어요.")
@@ -1989,11 +1623,10 @@ st.divider()
 # -----------------------------
 # ✅ 챗봇: 사진으로 코디 피드백 + 대화
 # -----------------------------
-st.subheader(L("chat", "💬 추구미 챗봇에게 물어보기"))
+st.subheader("💬 추구미 챗봇에게 물어보기")
 st.caption("선택 키워드/입력 내용을 바탕으로 ‘기준’과 ‘실천 팁’ 위주로 답해요. (브랜드 추천 없음)")
 
-# (추가) 챗봇용 코디 사진 업로드 + 피드백 생성
-st.markdown(f"### {L('chat_photo', '📸 사진으로 코디 피드백')}")
+st.markdown("### 📸 사진으로 코디 피드백")
 st.caption("내 코디 사진을 올리면, 이미 생성된 ‘추구미 리포트’ 기준으로 정합성/수정 포인트를 피드백해줘요. (얼굴/개인식별 분석 없음)")
 
 chat_up = st.file_uploader("코디 사진 업로드 (jpg/png)", type=["jpg", "jpeg", "png"], key="chat_style_photo_uploader")
@@ -2037,28 +1670,22 @@ if run_photo_feedback:
                 st.session_state["chat_style_feedback"] = fb_json
                 st.success(f"사진 피드백 생성 완료! (사용 모델: {used_model})")
 
-                # 챗 메시지로도 남기기(사용자가 바로 챗봇에게 추가 질문 가능)
                 md = format_outfit_feedback_md(fb_json)
                 st.session_state["style_messages"].append({"role": "assistant", "content": md})
 
             except Exception as e:
                 st.error(f"사진 피드백 오류: {e}")
 
-# 피드백이 있으면 화면에도 표시
 if st.session_state.get("chat_style_feedback"):
     st.markdown(format_outfit_feedback_md(st.session_state["chat_style_feedback"]))
 
 st.divider()
 
-# 기존 채팅 히스토리 렌더
 for m in st.session_state["style_messages"]:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-chat_hint = (st.session_state.get("ui_profile") or {}).get(
-    "chat_hint",
-    "예: '미니멀+시크 느낌을 유지하려면 패션에서 뭘 제일 조심해야 해?'",
-)
+chat_hint = "예: '지금 내 추구미에서 제일 자주 망하는 포인트 3개만 콕 집어줘.'"
 user_msg = st.chat_input(chat_hint)
 
 if user_msg:
@@ -2070,7 +1697,6 @@ if user_msg:
         with st.chat_message("assistant"):
             st.warning("사이드바에 OpenAI API Key를 입력하면 추구미 챗봇 답변을 받을 수 있어요.")
     else:
-        # 컨텍스트(사진 피드백 포함)
         ctx = {
             "gender": st.session_state["style_inputs"].get("gender", "female"),
             "selected_keywords": st.session_state["style_inputs"].get("keywords", []),
@@ -2081,18 +1707,17 @@ if user_msg:
             "pinterest_hint": {
                 "last_term": st.session_state.get("pinterest_last_term", ""),
                 "pin_count": len(st.session_state.get("last_pins") or []),
-                "pin_color_votes": (st.session_state.get("ui_profile") or {}).get("pin_votes", {}),
             },
             "style_report_summary": {
                 "type_name": (st.session_state.get("style_report") or {}).get("type_name_ko"),
+                "identity_one_liner": (st.session_state.get("style_report") or {}).get("identity_one_liner"),
                 "core_keywords": (st.session_state.get("style_report") or {}).get("core_keywords"),
                 "mini": (st.session_state.get("style_report") or {}).get("mini_report"),
-                "fashion": ((st.session_state.get("style_report") or {}).get("practice_guide") or {}).get("fashion"),
+                "practice_guide": (st.session_state.get("style_report") or {}).get("practice_guide"),
             },
             "photo_feedback_summary": st.session_state.get("chat_style_feedback"),
             "note": "브랜드/제품 추천 금지. 방향성과 기준, 체크리스트만.",
         }
-
         system_prompt = style_chat_system_prompt() + "\n\n[사용자 컨텍스트]\n" + json.dumps(ctx, ensure_ascii=False)
 
         with st.chat_message("assistant"):
