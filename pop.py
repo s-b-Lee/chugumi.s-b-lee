@@ -45,7 +45,7 @@ Gender = Literal["male", "female"]
 
 
 # -----------------------------
-# Keyword DB (✅ 추가: 20개 추구미 + 성별 분리 예시 5개)
+# Keyword DB (20개 추구미)
 # -----------------------------
 @dataclass(frozen=True)
 class KeywordMeta:
@@ -54,7 +54,6 @@ class KeywordMeta:
     style_elements: List[str]
 
 
-# 20개 핵심 추구미 키워드(10~30대 공감/구현 가능/독립성)
 KEYWORD_DB: Dict[str, KeywordMeta] = {
     "미니멀": KeywordMeta(
         "미니멀",
@@ -159,8 +158,6 @@ KEYWORD_DB: Dict[str, KeywordMeta] = {
 }
 
 STYLE_KEYWORDS = list(KEYWORD_DB.keys())
-
-# 5개 키워드: 성별 분리 상세 예시를 앱에서 보여줄 때도 사용(최대 5개 출력)
 DETAILED_KEYWORD_EXAMPLES = ["미니멀", "러블리", "섹시", "스트릿", "클래식"]
 
 
@@ -171,7 +168,7 @@ def init_state():
     defaults = {
         "style_messages": [],
         "style_inputs": {
-            "gender": "female",  # ✅ 추가
+            "gender": "female",
             "keywords": [],
             "text_like": "",
             "text_dislike": "",
@@ -189,16 +186,24 @@ def init_state():
         "working_image_model": None,
         "outfit_images": [],
 
-        # OAuth
+        # OAuth 관련 상태
         "pinterest_oauth_state": None,
         "pinterest_access_token": None,
         "pinterest_refresh_token": None,
         "pinterest_token_expires_at": None,
         "pinterest_last_auth_error": None,
 
+        # Pinterest 결과
         "last_pins": [],
+
+        # UI 프로필
         "ui_profile": None,
         "ui_applied": False,
+
+        # ✅ (추가) 챗봇 코디 피드백용 사진/결과
+        "chat_style_photo_bytes": None,
+        "chat_style_photo_name": None,
+        "chat_style_feedback": None,  # dict
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -275,7 +280,6 @@ def _extract_color_votes_from_text(text: str) -> Dict[str, int]:
 def _votes_to_style_bucket(votes: Dict[str, int]) -> str:
     if not votes:
         return ""
-
     score_mono = votes.get("black", 0) + votes.get("white", 0) + votes.get("gray", 0) + votes.get("grey", 0) + votes.get("charcoal", 0)
     score_soft = votes.get("ivory", 0) + votes.get("cream", 0) + votes.get("beige", 0) + votes.get("pink", 0) + votes.get("rose", 0) + votes.get("coral", 0)
     score_bold = votes.get("red", 0) + votes.get("burgundy", 0) + votes.get("wine", 0) + votes.get("black", 0)
@@ -290,7 +294,6 @@ def _votes_to_style_bucket(votes: Dict[str, int]) -> str:
 
 def derive_ui_profile(style_report: Dict[str, Any], pins: List[Dict[str, Any]]) -> Dict[str, Any]:
     r = style_report or {}
-    mini = r.get("mini_report") or {}
     guide = r.get("practice_guide") or {}
     fashion = (guide.get("fashion") or {}) if isinstance(guide, dict) else {}
 
@@ -311,7 +314,6 @@ def derive_ui_profile(style_report: Dict[str, Any], pins: List[Dict[str, Any]]) 
     pal_primary = _pick_first_hex(palette, "#6B7280")
     pal_secondary = _pick_first_hex(palette[1:] if len(palette) > 1 else [], "#E5E7EB")
 
-    # 키워드 기반(기존 로직 유지 + 키워드 20개에 맞게 약간 확장)
     if {"미니멀", "시크", "단정", "매니시"} & kset:
         base_bucket = "monochrome"
     elif {"러블리", "귀여움", "청순", "페미닌"} & kset:
@@ -325,10 +327,7 @@ def derive_ui_profile(style_report: Dict[str, Any], pins: List[Dict[str, Any]]) 
 
     bucket = base_bucket
     if pin_bucket:
-        if pin_bucket == base_bucket:
-            bucket = base_bucket
-        else:
-            bucket = base_bucket if palette else "neutral"
+        bucket = base_bucket if (pin_bucket == base_bucket or palette) else "neutral"
 
     theme_map = {
         "monochrome": {
@@ -388,8 +387,8 @@ def derive_ui_profile(style_report: Dict[str, Any], pins: List[Dict[str, Any]]) 
         },
     }
     t = theme_map.get(bucket, theme_map["neutral"])
-
     emoji = t["emoji"]
+
     labels = {
         "title": f"{emoji} 이미지 레시피 - 내 분위기 맞춤 모드",
         "sec0": f"{emoji} 0) 성별 선택",
@@ -402,6 +401,7 @@ def derive_ui_profile(style_report: Dict[str, Any], pins: List[Dict[str, Any]]) 
         "gender_split": f"{emoji} 성별 분리 스타일링 방향성",
         "outfit": f"{emoji} 예시 코디 (텍스트 + 시각화)",
         "chat": f"{emoji} 추구미 챗봇에게 물어보기",
+        "chat_photo": f"{emoji} 사진으로 코디 피드백",
     }
 
     chat_hint = "예: '이 분위기를 유지하려면 오늘 딱 10분 안에 뭘 하면 좋아?'"
@@ -713,6 +713,115 @@ def openai_vision_analyze_style_with_fallback(
     return json.loads(content), model
 
 
+# ✅ (추가) 챗봇용: 스타일링 사진 → 리포트 기준 피드백(JSON)
+def openai_vision_outfit_feedback_with_fallback(
+    api_key: str,
+    image_bytes: bytes,
+    style_report: Dict[str, Any],
+    style_inputs: Dict[str, Any],
+    model_candidates: List[str],
+) -> Tuple[Dict[str, Any], str]:
+    """
+    사용자가 '내 코디 사진'을 올렸을 때:
+    - 사진에서 패션 요소(아이템/핏/컬러/실루엣/텍스처/포인트)를 추출
+    - 추구미 리포트/키워드/제약과 비교해 정합성 피드백 제공
+    - 브랜드/제품명 금지
+    - 개인 식별/얼굴 분석 금지(얼굴은 무시하고 의상만)
+    """
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{b64}"
+
+    system_prompt = (
+        "당신은 '스타일링 코치'입니다.\n"
+        "사용자가 올린 '스타일링 사진'을 보고 패션 요소를 분석한 뒤, "
+        "제공된 '추구미 리포트' 기준으로 피드백을 제공합니다.\n"
+        "엄격한 규칙:\n"
+        "- 개인 식별/나이/외모 평가/체형 비하/얼굴 분석 금지. 얼굴은 무시하고 의상/스타일만.\n"
+        "- 브랜드/제품명 추천 금지(범용 아이템 표현만).\n"
+        "- 과장 금지, 사진에서 확인 가능한 범위만.\n"
+        "- 반드시 JSON으로만 답하세요.\n"
+    )
+
+    # 리포트 요약(토큰 절약 + 핵심 기준 고정)
+    report_summary = {
+        "type": style_report.get("type_name_ko"),
+        "core_keywords": style_report.get("core_keywords"),
+        "mini_report": style_report.get("mini_report"),
+        "fashion_guide": (style_report.get("practice_guide") or {}).get("fashion"),
+    }
+
+    user_text = {
+        "gender": style_inputs.get("gender", "female"),
+        "selected_keywords": style_inputs.get("keywords", []),
+        "text_like": style_inputs.get("text_like", ""),
+        "text_dislike": style_inputs.get("text_dislike", ""),
+        "text_constraints": style_inputs.get("text_constraints", ""),
+        "style_report_summary": report_summary,
+        "allowed_keywords": STYLE_KEYWORDS,
+        "output_schema": {
+            "detected": {
+                "top_items": [],
+                "silhouette_fit": "",
+                "color_tone": "",
+                "materials_textures": [],
+                "styling_points": [],
+                "risk_points": [],
+            },
+            "alignment": {
+                "score_0_100": 0,
+                "matches": [],
+                "breaks": [],
+            },
+            "feedback": {
+                "one_liner": "",
+                "keep_doing": [],
+                "fix_today_level1": [],
+                "routine_level2": [],
+                "plan_level3": [],
+                "avoid": [],
+                "next_purchase_suggestions": [],
+            },
+            "warnings": "",
+        },
+        "instructions": [
+            "detected.top_items는 상의/하의/아우터/신발/가방·악세서리 위주로 6~12개",
+            "alignment.score_0_100은 추구미 리포트 기준 정합성",
+            "breaks는 '왜 어긋나는지'를 구체적으로(톤/비율/질감/포인트 과잉 등)",
+            "fix_today_level1은 3~5개(바로 적용, 3~10분 내)",
+            "avoid는 5개 이상 + 대체 방향을 괄호로 간단히",
+            "next_purchase_suggestions는 3~5개(범용 아이템명, 브랜드 금지)",
+        ],
+    }
+
+    user_message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": json.dumps(user_text, ensure_ascii=False)},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ],
+    }
+
+    used_model = st.session_state.get("working_model")
+    candidates = [used_model] + model_candidates if used_model else model_candidates
+
+    def build_payload(model: str) -> Dict[str, Any]:
+        return {
+            "model": model,
+            "temperature": 0.2,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                user_message,
+            ],
+        }
+
+    model, resp = _try_models(api_key, build_payload, candidates, timeout=120)
+    st.session_state["working_model"] = model
+    content = resp["choices"][0]["message"]["content"]
+    return json.loads(content), model
+
+
 # -----------------------------
 # OpenAI Images API (optional) with fallback
 # -----------------------------
@@ -946,17 +1055,98 @@ def render_selected_keyword_cards(selected_keywords: List[str]):
                 st.markdown(f"  - {e}")
 
 
+def format_outfit_feedback_md(feedback: Dict[str, Any]) -> str:
+    """
+    코디 피드백 JSON을 챗 메시지/화면에 보기 좋은 Markdown으로 변환
+    """
+    if not feedback:
+        return "피드백 데이터가 없어요."
+
+    detected = feedback.get("detected", {}) or {}
+    alignment = feedback.get("alignment", {}) or {}
+    fb = feedback.get("feedback", {}) or {}
+
+    lines = []
+    one = fb.get("one_liner", "")
+    score = alignment.get("score_0_100", None)
+
+    if one:
+        lines.append(f"### 🧾 사진 기반 코디 피드백\n**한 줄 총평:** {one}")
+    else:
+        lines.append("### 🧾 사진 기반 코디 피드백")
+
+    if isinstance(score, int):
+        lines.append(f"**추구미 정합성 점수:** **{score}/100**")
+
+    items = detected.get("top_items", []) or []
+    if items:
+        lines.append("\n**보이는 아이템/구성(추정):**")
+        lines += [f"- {x}" for x in items[:14]]
+
+    if detected.get("silhouette_fit"):
+        lines.append(f"\n**실루엣/핏:** {detected.get('silhouette_fit')}")
+    if detected.get("color_tone"):
+        lines.append(f"**컬러 톤:** {detected.get('color_tone')}")
+
+    mats = detected.get("materials_textures", []) or []
+    if mats:
+        lines.append("\n**소재/텍스처 단서:**")
+        lines += [f"- {x}" for x in mats[:8]]
+
+    pts = detected.get("styling_points", []) or []
+    if pts:
+        lines.append("\n**스타일 포인트:**")
+        lines += [f"- {x}" for x in pts[:8]]
+
+    matches = (alignment.get("matches") or [])[:8]
+    breaks = (alignment.get("breaks") or [])[:8]
+    if matches:
+        lines.append("\n**잘 맞는 부분(keep):**")
+        lines += [f"- {x}" for x in matches]
+    if breaks:
+        lines.append("\n**어긋나는 부분(fix):**")
+        lines += [f"- {x}" for x in breaks]
+
+    keep = (fb.get("keep_doing") or [])[:6]
+    if keep:
+        lines.append("\n**계속 유지하면 좋은 것:**")
+        lines += [f"- {x}" for x in keep]
+
+    l1 = (fb.get("fix_today_level1") or [])[:6]
+    if l1:
+        lines.append("\n**Level 1 (오늘 3~10분 개선):**")
+        lines += [f"- {x}" for x in l1]
+
+    l2 = (fb.get("routine_level2") or [])[:6]
+    if l2:
+        lines.append("\n**Level 2 (주 2~3회 루틴):**")
+        lines += [f"- {x}" for x in l2]
+
+    l3 = (fb.get("plan_level3") or [])[:4]
+    if l3:
+        lines.append("\n**Level 3 (한 달 플랜):**")
+        lines += [f"- {x}" for x in l3]
+
+    avoid = (fb.get("avoid") or [])[:10]
+    if avoid:
+        lines.append("\n**Do-not (피해야 할 것):**")
+        lines += [f"- {x}" for x in avoid]
+
+    buy = (fb.get("next_purchase_suggestions") or [])[:6]
+    if buy:
+        lines.append("\n**다음 구매 후보(범용 아이템):**")
+        lines += [f"- {x}" for x in buy]
+
+    if feedback.get("warnings"):
+        lines.append(f"\n⚠️ {feedback.get('warnings')}")
+
+    return "\n".join(lines)
+
+
 # -----------------------------
-# Prompts (✅ 강화: 성별 분리 + 5개 예시 + 코디 출력 포맷)
+# Prompts
 # -----------------------------
 def style_report_prompt(style_inputs: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    리포트 생성용 프롬프트:
-    - 성별 반영
-    - 20 키워드 중 선택 기반
-    - 키워드별 성별 방향성(최대 5개)
-    - 코디 추천을 "컨셉/상의/하의/아우터/신발/악세서리/피해야"로 구체화
-    """
     system_prompt = (
         "당신은 '추구미 도우미(패션 트렌드 분석가 + 스타일링 앱 기획자)'입니다.\n"
         "입력(성별/키워드/선호/비선호/제약/이미지 분석)을 바탕으로 추구미 리포트를 생성합니다.\n"
@@ -972,7 +1162,6 @@ def style_report_prompt(style_inputs: Dict[str, Any]) -> Tuple[str, str]:
         "- '피해야 할 요소'는 반드시 항목형(최소 5개)으로.\n"
     )
 
-    # 키워드 DB를 모델에게 컨텍스트로 제공(앱 내 정의를 일관되게 쓰게 함)
     keyword_context = {
         "allowed_keywords": STYLE_KEYWORDS,
         "keyword_db": {k: {"vibe": v.vibe, "style_elements": v.style_elements} for k, v in KEYWORD_DB.items()},
@@ -1010,7 +1199,6 @@ def style_report_prompt(style_inputs: Dict[str, Any]) -> Tuple[str, str]:
                 },
                 "behavior_lifestyle": {"gesture_tone": "", "speech_manner": "", "daily_habits": []},
             },
-            # ✅ 요청 반영: 성별 분리 방향성(최대 5개)
             "gender_split_directions": [
                 {
                     "keyword": "",
@@ -1020,11 +1208,10 @@ def style_report_prompt(style_inputs: Dict[str, Any]) -> Tuple[str, str]:
                     "differentiation_points": [],
                 }
             ],
-            # ✅ 요청 반영: 코디 출력 포맷(구체)
             "outfit_recommendations": [
                 {
                     "title": "",
-                    "concept": "",  # 3줄 이내
+                    "concept": "",
                     "tops": ["", "", ""],
                     "bottoms": ["", "", ""],
                     "outers": ["", ""],
@@ -1094,6 +1281,9 @@ def style_chat_system_prompt() -> str:
 6) 사용자가 '무엇을 조심해야 해?'라고 물으면:
    - 금지 리스트(Do-not) 5개 + 대체안(Instead) 5개를 반드시 제시
 
+추가 규칙(사진 피드백이 함께 제공될 때):
+- 사진 피드백의 'matches/breaks/avoid'를 우선 근거로 삼아 구체적으로 말할 것
+- 외모 평가 금지, 의상/스타일 요소만
 """.strip()
 
 
@@ -1247,6 +1437,12 @@ with st.sidebar:
         st.session_state["last_pins"] = []
         st.session_state["ui_profile"] = None
         st.session_state["ui_applied"] = False
+
+        # 챗 사진/피드백 초기화
+        st.session_state["chat_style_photo_bytes"] = None
+        st.session_state["chat_style_photo_name"] = None
+        st.session_state["chat_style_feedback"] = None
+
         st.success("초기화 완료!")
         st.rerun()
 
@@ -1268,7 +1464,7 @@ pinterest_token = pinterest_token_oauth or (pinterest_token_manual.strip() or No
 # -----------------------------
 st.title(L("title", "🫧이미지 레시피 - 직접 설계하는 내 이미지"))
 
-# ✅ 진단 후 UI 적용 상태 배너
+# UI 적용 상태 배너
 if st.session_state.get("ui_profile"):
     p = st.session_state["ui_profile"]
     st.markdown(
@@ -1295,7 +1491,7 @@ if st.session_state.get("ui_profile"):
     st.write("")
 
 
-# 0) 성별 선택 (✅ 추가)
+# 0) 성별 선택
 st.subheader(L("sec0", "0) 성별 선택"))
 gender_label = st.radio(
     "추천 결과를 분리하기 위해 성별을 선택해 주세요",
@@ -1316,8 +1512,6 @@ selected = st.multiselect(
 )
 st.session_state["style_inputs"]["keywords"] = selected
 st.caption("※ 최소 3개, 최대 7개를 선택해 주세요.")
-
-# 선택 키워드의 앱 내부 설명(바로 확인 가능)
 render_selected_keyword_cards(selected)
 
 # 2) 추가 정보 입력
@@ -1387,8 +1581,9 @@ if st.session_state["style_inputs"].get("uploaded_image_analysis"):
 
 st.divider()
 
-
+# -----------------------------
 # Pinterest (OAuth/수동 토큰) + API 제한 시 웹검색 fallback
+# -----------------------------
 st.subheader(L("pinterest", "🧷 Pinterest 참고 이미지(인물 이미지 검색)"))
 st.caption("선택한 추구미 키워드로 Pinterest에서 참고 이미지를 가져옵니다(권한/토큰 필요). API 제한 시 웹검색으로 대체합니다.")
 
@@ -1539,7 +1734,7 @@ st.divider()
 
 
 # -----------------------------
-# 추구미 리포트 생성 (✅ 완료 후 UI를 '분위기 맞춤 모드'로 자동 전환)
+# 추구미 리포트 생성 (완료 후 UI 자동 전환)
 # -----------------------------
 st.subheader(L("report", "🧾 추구미 분석 & 리포트"))
 can_run = 3 <= len(st.session_state["style_inputs"]["keywords"]) <= 7
@@ -1596,7 +1791,7 @@ if st.session_state.get("style_report"):
         for x in best:
             st.markdown(f"  - {x}")
     else:
-        st.caption("어울리는 상황 정보가 없어요(리포트 생성 시 포함되도록 프롬프트를 강화해두었습니다).")
+        st.caption("어울리는 상황 정보가 없어요.")
 
     st.markdown(f"- 과도함 주의: {mini.get('watch_out','')}")
     st.markdown(f"- 유지 난이도: **{mini.get('maintenance_difficulty','')}**")
@@ -1639,12 +1834,12 @@ if st.session_state.get("style_report"):
     if b.get("daily_habits"):
         st.markdown("- 작은 습관:\n" + "\n".join([f"  - {x}" for x in b.get("daily_habits", [])]))
 
-    # ✅ 성별 분리 방향성 출력(최대 5개)
+    # 성별 분리 방향성
     st.divider()
     st.subheader(L("gender_split", "🧬 성별 분리 스타일링 방향성"))
     gsd = r.get("gender_split_directions") or []
     if not gsd:
-        st.caption("성별 분리 방향성 데이터가 없어요(리포트 프롬프트에서 생성하도록 유도해두었습니다).")
+        st.caption("성별 분리 방향성 데이터가 없어요.")
     else:
         for block in gsd[:5]:
             kw = (block or {}).get("keyword", "")
@@ -1677,13 +1872,12 @@ if st.session_state.get("style_report"):
                     st.markdown("**차별화 포인트**")
                     st.markdown("\n".join([f"- {x}" for x in diff]))
 
-    # ✅ 코디 추천(구체 포맷)
+    # 코디 추천 + 시각화
     st.divider()
     st.subheader(L("outfit", "🧥 예시 코디 (텍스트 + 시각화)"))
-
     outfit_recos = r.get("outfit_recommendations") or []
     if not outfit_recos:
-        st.caption("코디 추천이 없어요(리포트 생성 프롬프트에서 생성하도록 유도해두었습니다).")
+        st.caption("코디 추천이 없어요.")
     else:
         for i, ex in enumerate(outfit_recos[:6], start=1):
             title = (ex or {}).get("title", f"코디 {i}")
@@ -1728,7 +1922,6 @@ if st.session_state.get("style_report"):
                 if refs:
                     st.caption("팔레트 참고: " + ", ".join([str(x) for x in refs]))
 
-        # 시각화
         st.markdown("#### 🎨 코디 시각화(이미지 생성)")
         st.caption("선택한 코디를 ‘룩북 스타일’로 간단히 시각화합니다. (브랜드 로고/문구 없이)")
 
@@ -1755,7 +1948,6 @@ if st.session_state.get("style_report"):
                     if isinstance(c, dict)
                 }
                 ref_hex = [f"{n}:{palette_map.get(n)}" for n in refs if palette_map.get(n)]
-
                 items_join = ", ".join([*tops[:3], *bottoms[:3], *outers[:2], *shoes[:2], *acc[:6]])
 
                 img_prompt = (
@@ -1795,11 +1987,70 @@ st.divider()
 
 
 # -----------------------------
-# 추구미 챗봇(대화)
+# ✅ 챗봇: 사진으로 코디 피드백 + 대화
 # -----------------------------
 st.subheader(L("chat", "💬 추구미 챗봇에게 물어보기"))
 st.caption("선택 키워드/입력 내용을 바탕으로 ‘기준’과 ‘실천 팁’ 위주로 답해요. (브랜드 추천 없음)")
 
+# (추가) 챗봇용 코디 사진 업로드 + 피드백 생성
+st.markdown(f"### {L('chat_photo', '📸 사진으로 코디 피드백')}")
+st.caption("내 코디 사진을 올리면, 이미 생성된 ‘추구미 리포트’ 기준으로 정합성/수정 포인트를 피드백해줘요. (얼굴/개인식별 분석 없음)")
+
+chat_up = st.file_uploader("코디 사진 업로드 (jpg/png)", type=["jpg", "jpeg", "png"], key="chat_style_photo_uploader")
+if chat_up is not None:
+    cbytes = chat_up.read()
+    st.session_state["chat_style_photo_bytes"] = cbytes
+    st.session_state["chat_style_photo_name"] = chat_up.name
+    st.image(cbytes, caption=f"업로드: {chat_up.name}", use_container_width=True)
+
+cols_pf = st.columns([1, 1, 2])
+with cols_pf[0]:
+    run_photo_feedback = st.button("🧾 사진으로 피드백 받기", use_container_width=True)
+with cols_pf[1]:
+    clear_photo_feedback = st.button("🧹 사진/피드백 지우기", use_container_width=True)
+with cols_pf[2]:
+    st.caption("※ 사진 피드백은 ‘리포트가 있을 때’ 가장 정확합니다. 리포트 없이도 동작은 하지만 기준이 약해져요.")
+
+if clear_photo_feedback:
+    st.session_state["chat_style_photo_bytes"] = None
+    st.session_state["chat_style_photo_name"] = None
+    st.session_state["chat_style_feedback"] = None
+    st.success("사진/피드백을 초기화했어요.")
+    st.rerun()
+
+if run_photo_feedback:
+    if not openai_key:
+        st.warning("OpenAI API Key를 입력해 주세요.")
+    elif st.session_state.get("chat_style_photo_bytes") is None:
+        st.warning("먼저 코디 사진을 업로드해 주세요.")
+    else:
+        with st.spinner("사진에서 스타일 요소를 분석하고, 리포트 기준으로 피드백을 생성 중..."):
+            try:
+                style_report = st.session_state.get("style_report") or {}
+                fb_json, used_model = openai_vision_outfit_feedback_with_fallback(
+                    openai_key,
+                    st.session_state["chat_style_photo_bytes"],
+                    style_report=style_report,
+                    style_inputs=st.session_state["style_inputs"],
+                    model_candidates=model_candidates,
+                )
+                st.session_state["chat_style_feedback"] = fb_json
+                st.success(f"사진 피드백 생성 완료! (사용 모델: {used_model})")
+
+                # 챗 메시지로도 남기기(사용자가 바로 챗봇에게 추가 질문 가능)
+                md = format_outfit_feedback_md(fb_json)
+                st.session_state["style_messages"].append({"role": "assistant", "content": md})
+
+            except Exception as e:
+                st.error(f"사진 피드백 오류: {e}")
+
+# 피드백이 있으면 화면에도 표시
+if st.session_state.get("chat_style_feedback"):
+    st.markdown(format_outfit_feedback_md(st.session_state["chat_style_feedback"]))
+
+st.divider()
+
+# 기존 채팅 히스토리 렌더
 for m in st.session_state["style_messages"]:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
@@ -1819,6 +2070,7 @@ if user_msg:
         with st.chat_message("assistant"):
             st.warning("사이드바에 OpenAI API Key를 입력하면 추구미 챗봇 답변을 받을 수 있어요.")
     else:
+        # 컨텍스트(사진 피드백 포함)
         ctx = {
             "gender": st.session_state["style_inputs"].get("gender", "female"),
             "selected_keywords": st.session_state["style_inputs"].get("keywords", []),
@@ -1835,9 +2087,12 @@ if user_msg:
                 "type_name": (st.session_state.get("style_report") or {}).get("type_name_ko"),
                 "core_keywords": (st.session_state.get("style_report") or {}).get("core_keywords"),
                 "mini": (st.session_state.get("style_report") or {}).get("mini_report"),
+                "fashion": ((st.session_state.get("style_report") or {}).get("practice_guide") or {}).get("fashion"),
             },
+            "photo_feedback_summary": st.session_state.get("chat_style_feedback"),
             "note": "브랜드/제품 추천 금지. 방향성과 기준, 체크리스트만.",
         }
+
         system_prompt = style_chat_system_prompt() + "\n\n[사용자 컨텍스트]\n" + json.dumps(ctx, ensure_ascii=False)
 
         with st.chat_message("assistant"):
